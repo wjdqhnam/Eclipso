@@ -119,7 +119,7 @@ def extract_text(file_bytes: bytes) -> dict:
     return {"full_text": full_text, "pages": [{"page": 1, "text": full_text}]}
 
 def redact(file_bytes: bytes) -> bytes:
-    """PPT TextCharsAtom 기반 치환"""
+    """PPT 포맷 유지형: TextCharsAtom 교체"""
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("PowerPoint Document"):
             return file_bytes
@@ -127,16 +127,21 @@ def redact(file_bytes: bytes) -> bytes:
 
     off = 0
     while off + 8 < len(buf):
-        recVer, recInstance, recType, recLen = struct.unpack_from("<HHII", buf, off)
+        try:
+            recVer, recInstance, recType, recLen = struct.unpack_from("<HHII", buf, off)
+        except struct.error:
+            break
         off += 8
+
         if recType == 0x0FA0:  # TextCharsAtom
             raw = buf[off:off + recLen]
             try:
                 text = raw.decode("utf-16le", errors="ignore")
-                redacted = apply_redaction_rules(text)
-                enc = redacted.encode("utf-16le")
-                buf[off:off+recLen] = enc[:recLen].ljust(recLen, b"\x00")
+                red = apply_redaction_rules(text)
+                enc = red.encode("utf-16le")
+                buf[off:off + recLen] = enc[:recLen].ljust(recLen, b"\x00")
             except Exception:
                 pass
         off += recLen
+
     return bytes(buf)

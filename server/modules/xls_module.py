@@ -109,7 +109,7 @@ def extract_text_from_xls(file_bytes: bytes):
 
 
 def redact(file_bytes: bytes) -> bytes:
-    """XLS SST 내부 문자열 동일길이 치환"""
+    """XLS 포맷 유지형: SST / LABELSST 내 문자열 교체"""
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):
             return file_bytes
@@ -122,16 +122,18 @@ def redact(file_bytes: bytes) -> bytes:
         payload_off = off
         payload_end = off + length
 
-        if opcode in (0x00FC, 0x00FD, 0x0204):
+        if opcode in (0x00FC, 0x00FD, 0x0204):  # SST, LABELSST, LABEL
             chunk = wb[payload_off:payload_end]
             try:
-                txt = chunk.decode("utf-16le", errors="ignore") or chunk.decode("cp949", errors="ignore")
-                redacted = apply_redaction_rules(txt)
-                enc = redacted.encode("utf-16le") if len(txt.encode("utf-16le")) == len(chunk) else redacted.encode("cp949", errors="ignore")
-                wb[payload_off:payload_off+len(enc)] = enc.ljust(len(chunk), b"\x00")
+                text = chunk.decode("utf-16le", errors="ignore") or chunk.decode("cp949", errors="ignore")
+                red = apply_redaction_rules(text)
+                enc = red.encode("utf-16le")
+                wb[payload_off:payload_end] = enc[:length].ljust(length, b"\x00")
             except Exception:
                 pass
+
         off = payload_end
+
     return bytes(wb)
 
 def extract_text(file_bytes: bytes) -> dict:
