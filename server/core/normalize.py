@@ -51,6 +51,5 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
     text = text.replace("\t", " ")
     text = re.sub(r"[ \f\v]+", " ", text)
     text = "\n".join(re.sub(r"[ \t]+$", "", line) for line in text.split("\n"))
-    print(f"index_map: {index_map}")
 
     return text, index_map

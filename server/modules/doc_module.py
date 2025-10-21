@@ -16,17 +16,16 @@ def le32(b: bytes, off: int) -> int:
     return struct.unpack_from("<I", b, off)[0]
 
 
-# WordDocument/Table Stream 처리
+# 테이블 스트림 이름 반환
 def _get_table_stream_name(word_data: bytes, ole: olefile.OleFileIO) -> Optional[str]:
-    """테이블 스트림 이름 반환"""
     fib_flags = le16(word_data, 0x000A)
     fWhichTblStm = (fib_flags & 0x0200) != 0
     tbl_name = "1Table" if fWhichTblStm and ole.exists("1Table") else "0Table"
     return tbl_name if ole.exists(tbl_name) else None
 
 
+# WordDocument와 Table 스트림 읽기
 def _read_word_and_table_streams(file_bytes: bytes) -> Tuple[Optional[bytes], Optional[bytes], Optional[str]]:
-    """WordDocument와 Table 스트림 읽기"""
     try:
         buffer = io.BytesIO(file_bytes)
         buffer.seek(0)
@@ -43,17 +42,17 @@ def _read_word_and_table_streams(file_bytes: bytes) -> Tuple[Optional[bytes], Op
         return None, None, None
 
 
+# CLX 데이터 추출
 def _get_clx_data(word_data: bytes, table_data: bytes) -> Optional[bytes]:
-    """CLX 데이터 추출"""
     fcClx = le32(word_data, 0x01A2)
     lcbClx = le32(word_data, 0x01A6)
     if fcClx + lcbClx > len(table_data):
         return None
     return table_data[fcClx:fcClx + lcbClx]
 
-# CLX / PlcPcd 파서
+
+# CLX 블록에서 PlcPcd 서브블록 추출
 def _extract_plcpcd(clx: bytes) -> bytes:
-    """CLX 블록에서 PlcPcd 서브블록 추출"""
     i = 0
     while i < len(clx):
         tag = clx[i]
@@ -72,9 +71,8 @@ def _extract_plcpcd(clx: bytes) -> bytes:
     return b""
 
 
-
+# PlcPcd에서 조각 정보 추출
 def _parse_plcpcd(plcpcd: bytes) -> List[Dict[str, Any]]:
-    """PlcPcd에서 조각 정보 추출"""
     size = len(plcpcd)
     if size < 4 or (size - 4) % 12 != 0:
         return []
@@ -102,8 +100,8 @@ def _parse_plcpcd(plcpcd: bytes) -> List[Dict[str, Any]]:
     return pieces
 
 
+# 조각 디코딩
 def _decode_piece(chunk: bytes, fCompressed: bool) -> str:
-    """조각 디코딩"""
     try:
         return chunk.decode("cp1252" if fCompressed else "utf-16le", errors="ignore")
     except Exception:
@@ -112,7 +110,6 @@ def _decode_piece(chunk: bytes, fCompressed: bool) -> str:
 
 # 텍스트 추출 (정규화 포함)
 def extract_text(file_bytes: bytes) -> dict:
-    """DOC 본문 텍스트 추출"""
     try:
         word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
         if not word_data:
@@ -138,7 +135,7 @@ def extract_text(file_bytes: bytes) -> dict:
             chunk = word_data[start:end]
             texts.append(_decode_piece(chunk, p["fCompressed"]))
 
-        full_text = "\n".join(texts)
+        full_text = "".join(texts)
         normalized_text = normalization_text(full_text)
         return {"full_text": normalized_text, "pages": [{"page": 1, "text": normalized_text}]}
     except Exception as e:
@@ -146,9 +143,8 @@ def extract_text(file_bytes: bytes) -> dict:
         return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
-# 동일 길이 치환 (*)
+# 동일 길이의 *로 치환
 def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replacement_char: str = "*") -> bytes:
-    """정규화 기반 탐지 결과를 반영하여 동일 길이 '*'로 치환"""
     try:
         word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
         if not word_data or not table_data:
@@ -161,24 +157,55 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
             raise ValueError("PlcPcd 데이터를 추출할 수 없습니다")
 
         pieces = _parse_plcpcd(plcpcd)
+
+        # 조각별로 원문 텍스트 인덱스 구간을 누적 계산
+        piece_spans = []
+        cur = 0
+        for p in pieces:
+            fc_base = p["fc"]
+            bytes_per_char = 1 if p["fCompressed"] else 2
+            start, end = fc_base, fc_base + p["byte_count"]
+
+            # 디코딩해서 실제 문자 길이로 계산
+            decode_p = _decode_piece(word_data[start:end], p["fCompressed"])
+            char_len = len(decode_p)
+
+            # 정규화 전 원문 텍스트에서의 누적 문자 범위
+            piece_spans.append((cur, cur + char_len, fc_base, bytes_per_char))
+            cur += char_len
+
         replaced_word_data = bytearray(word_data)
         total_replacement = 0
 
+        # 각  텍스트 인덱스 구간을 조각 경계에 맞춰 실제 바이트로 변환해 치환
         for start, end, _ in targets:
-            for p in pieces:
-                fc_base = p["fc"]
-                byte_per_char = 1 if p["fCompressed"] else 2
-                cp_start = p["cp_start"]
-                cp_end = p["cp_end"]
+            s = start
+            e = end
+            if s >= e:
+                continue
 
-                # 탐지된 인덱스가 이 조각 범위에 포함될 때만
-                if start >= cp_start and start < cp_end:
-                    real_byte_start = fc_base + (start - cp_start) * byte_per_char
-                    real_byte_end   = fc_base + (end - cp_start) * byte_per_char
+            for text_start, text_end, fc_base, bpc in piece_spans:
+                # 교집합 길이
+                if s >= text_end or e <= text_start:
+                    continue
+                local_start = max(s, text_start)
+                local_end   = min(e, text_end)
+                if local_start >= local_end:
+                    continue
 
-                    replacement_bytes = b"*" * (real_byte_end - real_byte_start)
-                    replaced_word_data[real_byte_start:real_byte_end] = replacement_bytes
-                    total_replacement += 1
+                # 이 조각 내에서의 문자 오프셋 → 바이트 오프셋
+                byte_start = fc_base + (local_start - text_start) * bpc
+                byte_len   = (local_end - local_start) * bpc
+
+                # 바이트 치환
+                if bpc == 1:
+                    replacement_bytes = (replacement_char.encode("latin-1", "ignore") or b"*")[0:1] * byte_len
+                else:
+                    # UTF-16LE: '*' + null
+                    replacement_bytes = (replacement_char.encode("utf-16le")[:2] or b"*\x00") * ((byte_len)//2)
+
+                replaced_word_data[byte_start:byte_start+byte_len] = replacement_bytes
+                total_replacement += 1  # 조각 단위로 카운트
 
 
         print(f"총 {total_replacement}개 치환 완료")
@@ -190,7 +217,6 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
 
 # WordDocument 스트림 교체
 def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
-    """olefile 공식 write_stream()을 사용해 WordDocument만 교체"""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
             tmp.write(original_file_bytes)
