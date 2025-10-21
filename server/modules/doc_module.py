@@ -114,18 +114,18 @@ def extract_text(file_bytes: bytes) -> dict:
         word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
         if not word_data:
             print("WordDocument 스트림 없음 → 빈 텍스트 반환")
-            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
         if not table_data:
             print("Table 스트림 없음:", tbl_name)
-            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
         clx = _get_clx_data(word_data, table_data)
         if not clx:
             print("CLX 범위 초과 → 무시")
-            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
         plcpcd = _extract_plcpcd(clx)
         if not plcpcd:
             print("PlcPcd 없음")
-            return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
         pieces = _parse_plcpcd(plcpcd)
 
         texts = []
@@ -137,10 +137,10 @@ def extract_text(file_bytes: bytes) -> dict:
 
         full_text = "".join(texts)
         normalized_text = normalization_text(full_text)
-        return {"full_text": normalized_text, "pages": [{"page": 1, "text": normalized_text}]}
+        return {"full_text": normalized_text, "raw_text": full_text, "pages": [{"page": 1, "text": normalized_text}]}
     except Exception as e:
         print("DOC 추출 중 예외:", e)
-        return {"full_text": "", "pages": [{"page": 1, "text": ""}]}
+        return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
 # 동일 길이의 *로 치환
@@ -243,7 +243,8 @@ def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> by
 def redact(file_bytes: bytes) -> bytes:
     try:
         extracted_data = extract_text(file_bytes)
-        original_text = extracted_data["full_text"]
+        # 원문(raw_text)을 사용해 정규화 인덱스 맵 생성 (extract_text에서 원문도 반환하도록 변경)
+        original_text = extracted_data.get("raw_text", extracted_data.get("full_text", ""))
         if not original_text:
             print("추출된 텍스트가 없음. 레닥션 건너뜀")
             return file_bytes
