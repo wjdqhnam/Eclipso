@@ -110,109 +110,102 @@ def _decode_piece(chunk: bytes, fCompressed: bool) -> str:
 
 # 텍스트 추출 (정규화 포함)
 def extract_text(file_bytes: bytes) -> dict:
+    pieces: List[Dict[str, Any]] = [] 
     try:
         word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
         if not word_data:
             print("WordDocument 스트림 없음 → 빈 텍스트 반환")
-            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
         if not table_data:
             print("Table 스트림 없음:", tbl_name)
-            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
         clx = _get_clx_data(word_data, table_data)
         if not clx:
             print("CLX 범위 초과 → 무시")
-            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
         plcpcd = _extract_plcpcd(clx)
         if not plcpcd:
             print("PlcPcd 없음")
-            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
+            return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
         pieces = _parse_plcpcd(plcpcd)
 
         texts = []
         for p in pieces:
             start, end = p["fc"], p["fc"] + p["byte_count"]
-            if end > len(word_data): continue
+            if end > len(word_data): 
+                continue
             chunk = word_data[start:end]
             texts.append(_decode_piece(chunk, p["fCompressed"]))
 
         full_text = "".join(texts)
         normalized_text = normalization_text(full_text)
-        return {"full_text": normalized_text, "raw_text": full_text, "pages": [{"page": 1, "text": normalized_text}]}
+        return {
+            "full_text": normalized_text,
+            "raw_text": full_text,
+            "pages": [{"page": 1, "text": normalized_text}],
+            "pieces": pieces, 
+        }
+    
     except Exception as e:
         print("DOC 추출 중 예외:", e)
-        return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
+        return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}], "pieces": pieces}
 
 
-# 동일 길이의 *로 치환
-def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replacement_char: str = "*") -> bytes:
+
+# 동일 길이의 *로 치환 (Piece 단위 cp→fc 변환)
+def replace_text(
+    file_bytes: bytes,
+    targets: List[Tuple[int, int, str]],
+    pieces: List[Dict[str, Any]],
+    replacement_char: str = "*"
+) -> bytes:
     try:
         word_data, table_data, tbl_name = _read_word_and_table_streams(file_bytes)
         if not word_data or not table_data:
             raise ValueError("WordDocument 또는 Table 스트림을 읽을 수 없습니다")
-        clx = _get_clx_data(word_data, table_data)
-        if not clx:
-            raise ValueError("CLX 데이터를 추출할 수 없습니다")
-        plcpcd = _extract_plcpcd(clx)
-        if not plcpcd:
-            raise ValueError("PlcPcd 데이터를 추출할 수 없습니다")
 
-        pieces = _parse_plcpcd(plcpcd)
-
-        # 조각별로 원문 텍스트 인덱스 구간을 누적 계산
+        # 전달받은 pieces로 cp→fc 매핑 구성
         piece_spans = []
-        cur = 0
         for p in pieces:
+            cp_start = p["cp_start"]
+            cp_end = p["cp_end"]
             fc_base = p["fc"]
-            bytes_per_char = 1 if p["fCompressed"] else 2
-            start, end = fc_base, fc_base + p["byte_count"]
-
-            # 디코딩해서 실제 문자 길이로 계산
-            decode_p = _decode_piece(word_data[start:end], p["fCompressed"])
-            char_len = len(decode_p)
-
-            # 정규화 전 원문 텍스트에서의 누적 문자 범위
-            piece_spans.append((cur, cur + char_len, fc_base, bytes_per_char))
-            cur += char_len
+            bpc = 1 if p["fCompressed"] else 2
+            piece_spans.append((cp_start, cp_end, fc_base, bpc))
 
         replaced_word_data = bytearray(word_data)
         total_replacement = 0
 
-        # 각  텍스트 인덱스 구간을 조각 경계에 맞춰 실제 바이트로 변환해 치환
         for start, end, _ in targets:
-            s = start
-            e = end
-            if s >= e:
+            if start >= end:
                 continue
-
             for text_start, text_end, fc_base, bpc in piece_spans:
-                # 교집합 길이
-                if s >= text_end or e <= text_start:
+                if start >= text_end or end <= text_start:
                     continue
-                local_start = max(s, text_start)
-                local_end   = min(e, text_end)
+                local_start = max(start, text_start)
+                local_end   = min(end, text_end)
                 if local_start >= local_end:
                     continue
 
-                # 이 조각 내에서의 문자 오프셋 → 바이트 오프셋
                 byte_start = fc_base + (local_start - text_start) * bpc
                 byte_len   = (local_end - local_start) * bpc
 
-                # 바이트 치환
                 if bpc == 1:
-                    replacement_bytes = (replacement_char.encode("latin-1", "ignore") or b"*")[0:1] * byte_len
+                    unit = (replacement_char.encode("latin-1", "ignore") or b"*")[0:1]
+                    replacement_bytes = unit * byte_len
                 else:
-                    # UTF-16LE: '*' + null
-                    replacement_bytes = (replacement_char.encode("utf-16le")[:2] or b"*\x00") * ((byte_len)//2)
+                    unit = (replacement_char.encode("utf-16le")[:2] or b"*\x00")
+                    replacement_bytes = unit * (byte_len // 2)
 
                 replaced_word_data[byte_start:byte_start+byte_len] = replacement_bytes
-                total_replacement += 1  # 조각 단위로 카운트
-
+                total_replacement += 1
 
         print(f"총 {total_replacement}개 치환 완료")
         return _create_new_ole_file(file_bytes, bytes(replaced_word_data))
     except Exception as e:
         print(f"텍스트 치환 중 오류: {e}")
         return file_bytes
+
 
 
 # WordDocument 스트림 교체
@@ -243,30 +236,30 @@ def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> by
 def redact(file_bytes: bytes) -> bytes:
     try:
         extracted_data = extract_text(file_bytes)
-        # 원문(raw_text)을 사용해 정규화 인덱스 맵 생성 (extract_text에서 원문도 반환하도록 변경)
         original_text = extracted_data.get("raw_text", extracted_data.get("full_text", ""))
         if not original_text:
             print("추출된 텍스트가 없음. 레닥션 건너뜀")
             return file_bytes
-        
-        #정규화 + 인덱스 맵 생성
+
         normalized_text, index_map = normalization_index(original_text)
 
-        #정규식 기반 탐지 결과 
         matches = find_sensitive_spans(normalized_text)
-        if not matches: 
+        if not matches:
             print("민감정보가 발견되지 않아 원본 파일 반환")
             return file_bytes
 
-        #원문 인덱스로 변환
         targets = []
         for start, end, value, _ in matches:
+            # index_map 누락 보호
+            if start not in index_map or (end - 1) not in index_map:
+                continue
             orig_start = index_map[start]
             orig_end = index_map[end - 1] + 1
-            targets.append((orig_start, orig_end, value))
+            if orig_start < orig_end:
+                targets.append((orig_start, orig_end, value))
 
-        # 실제 바이트 치환 수행
-        return replace_text(file_bytes, targets)
+        pieces = extracted_data.get("pieces", [])
+        return replace_text(file_bytes, targets, pieces)
 
     except Exception as e:
         print(f"DOC 레닥션 중 오류: {e}")

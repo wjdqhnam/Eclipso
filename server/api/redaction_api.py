@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Literal, Tuple, Set
 
+from urllib.parse import quote
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 from server.core.schemas import DetectResponse, PatternItem, Box
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
@@ -13,9 +14,9 @@ from server.core.redaction_rules import PRESET_PATTERNS
 from server.core.matching import find_sensitive_spans
 
 
+
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
-
 
 def _ensure_pdf(file: UploadFile) -> None:
     if file is None:
