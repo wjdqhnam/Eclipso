@@ -9,6 +9,7 @@ async def redact_file(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
     file_bytes = await file.read()
     out, mime, fname = None, "application/octet-stream", file.filename  # 원본 파일명 유지
+    encoded_fileName = file.filename.encode("utf-8", "ignore").decode("latin-1", "ignore") #한국어 인코딩처리
 
     try:
         if ext == ".doc":
@@ -37,6 +38,6 @@ async def redact_file(file: UploadFile = File(...)):
     return Response(
         content=out,
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        headers={"Content-Disposition": f'attachment; filename="{encoded_fileName}"'}
     )
 

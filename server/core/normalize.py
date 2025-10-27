@@ -30,26 +30,45 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
     if not s:
         return "", {}
 
-    normalized_chars: list[str] = []
+    out_chars: list[str] = []
     index_map: dict[int, int] = {}
     norm_i = 0
+    prev_space = False
 
     for i, ch in enumerate(s):
-        norm_ch = unicodedata.normalize("NFKC", ch)
-        if _ZERO_WIDTH.match(norm_ch):
+        # 1) NFKC
+        norm = unicodedata.normalize("NFKC", ch)
+        # 2) 제로폭 제거
+        if _ZERO_WIDTH.match(norm):
             continue
-        norm_ch = _NBSP.sub(" ", norm_ch)
-        norm_ch = _DASHES.sub("-", norm_ch)
-        for c in norm_ch:
-            normalized_chars.append(c)
+        # 3) NBSP류 → ' '
+        norm = _NBSP.sub(" ", norm)
+        # 4) 대시류 → '-'
+        norm = _DASHES.sub("-", norm)
+
+        for c in norm:
+            # 탭 → 공백
+            if c == "\t":
+                c = " "
+            # CR/LF 정규화: \r?\n → \n  (여기서는 이미 원문 문자 단위에서 처리)
+            if c == "\r":
+                continue
+
+            # 연속 공백 압축 (줄바꿈 제외)
+            if c == " ":
+                if prev_space:
+                    continue
+                prev_space = True
+            else:
+                if c == "\n":
+                    prev_space = False
+                else:
+                    prev_space = False
+
+            out_chars.append(c)
             index_map[norm_i] = i
             norm_i += 1
 
-    text = "".join(normalized_chars)
-    # 후처리 (공백, 줄바꿈 등 동일 정리)
-    text = re.sub(r"\r\n?", "\n", text)
-    text = text.replace("\t", " ")
-    text = re.sub(r"[ \f\v]+", " ", text)
-    text = "\n".join(re.sub(r"[ \t]+$", "", line) for line in text.split("\n"))
-
+    text = "".join(out_chars)
+    # 후처리 제거: 여기서 공백/개행을 또 건드리면 index_map이 틀어질 수 있음.
     return text, index_map
