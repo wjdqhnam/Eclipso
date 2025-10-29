@@ -2,8 +2,8 @@
 from __future__ import annotations
 import re, zipfile
 from typing import List, Tuple
-from .common import cleanup_text, compile_rules, sub_text_nodes, chart_sanitize
-from ..schemas import XmlMatch, XmlLocation
+from ..modules.common import cleanup_text, compile_rules, sub_text_nodes, chart_sanitize
+from ..core.schemas import XmlMatch, XmlLocation
 
 def docx_text(zipf: zipfile.ZipFile) -> str:
     try:
@@ -45,3 +45,21 @@ def redact_item(filename: str, data: bytes, comp):
         b2, _ = chart_sanitize(data, comp)
         return sub_text_nodes(b2, comp)[0]
     return data
+
+def extract_text(file_bytes: bytes) -> dict:
+    """DOCX 파일에서 텍스트 추출"""
+    import io, zipfile, re
+    from server.modules.common import cleanup_text
+
+    try:
+        with io.BytesIO(file_bytes) as bio, zipfile.ZipFile(bio, "r") as zipf:
+            all_txt = []
+            # Word 문단 및 표 텍스트
+            for name in sorted(n for n in zipf.namelist() if n.startswith("word/") and n.endswith(".xml")):
+                xml = zipf.read(name).decode("utf-8", "ignore")
+                for m in re.finditer(r">([^<>]+)<", xml):
+                    all_txt.append(m.group(1))
+            joined = "\n".join(all_txt)
+            return {"full_text": cleanup_text(joined)}
+    except Exception as e:
+        raise Exception(f"DOCX 텍스트 추출 실패: {e}")

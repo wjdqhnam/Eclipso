@@ -7,7 +7,7 @@ from .common import (
     redact_embedded_xlsx_bytes, redact_ole_conservative,
     HWPX_STRIP_PREVIEW, HWPX_DISABLE_CACHE, HWPX_BLANK_PREVIEW, HWPX_BLANK_OLE_BINDATA
 )
-from ..schemas import XmlMatch, XmlLocation
+from ..core.schemas import XmlMatch, XmlLocation
 
 def hwpx_text(zipf: zipfile.ZipFile) -> str:
     out = []
@@ -88,3 +88,22 @@ def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
             return redact_ole_conservative(data)
 
     return None
+
+def extract_text(file_bytes: bytes) -> dict:
+    """HWPX 파일에서 텍스트 추출"""
+    import io, zipfile, re
+    from server.modules.common import cleanup_text
+
+    try:
+        with io.BytesIO(file_bytes) as bio, zipfile.ZipFile(bio, "r") as zipf:
+            all_txt = []
+            for name in sorted(n for n in zipf.namelist() if n.endswith(".xml")):
+                xml = zipf.read(name).decode("utf-8", "ignore")
+                # 문단/본문 텍스트
+                all_txt += re.findall(r"<w:t[^>]*>(.*?)</w:t>", xml)
+                # <hp:t> 등 태그에도 포함될 수 있음
+                all_txt += re.findall(r"<hp:t[^>]*>(.*?)</hp:t>", xml)
+            joined = "\n".join(all_txt)
+            return {"full_text": cleanup_text(joined)}
+    except Exception as e:
+        raise Exception(f"HWPX 텍스트 추출 실패: {e}")

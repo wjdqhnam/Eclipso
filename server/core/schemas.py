@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
+from typing import List, Optional
 
 class PatternItem(BaseModel):
     name: str
@@ -26,3 +27,22 @@ class DetectResponse(BaseModel):
 class RedactRequest(BaseModel):
     boxes: List[Box]
     fill: Literal["black", "white"] = "black"
+
+class XmlLocation(BaseModel):
+    kind: str
+    part: str
+    start: int
+    end: int
+
+class XmlMatch(BaseModel):
+    rule: str
+    value: str
+    valid: bool
+    context: Optional[str]
+    location: XmlLocation
+
+class XmlScanResponse(BaseModel):
+    file_type: str
+    total_matches: int
+    matches: List[XmlMatch]
+    extracted_text: Optional[str]

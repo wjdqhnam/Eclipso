@@ -2,7 +2,7 @@
 from __future__ import annotations
 import io, re, zipfile, xml.etree.ElementTree as ET
 from typing import Tuple, List, Dict
-from ..redac_rules import PRESET_PATTERNS, RULES
+from ..core.redaction_rules import PRESET_PATTERNS, RULES
 
 # ---------- 옵션(HWPX에서 사용) ----------
 HWPX_STRIP_PREVIEW = True

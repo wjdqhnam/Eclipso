@@ -1,11 +1,15 @@
 from fastapi import UploadFile, HTTPException
-from server.modules import doc_module, ppt_module, xls_module, hwp_module, pdf_module
+from server.modules import doc_module, docx_module, ppt_module, pptx_module, xls_module, xlsx_module, hwp_module, hwpx_module, pdf_module
 
 MODULE_MAP = {
     ".doc": doc_module,
+    ".docx": docx_module,  # 추가
     ".ppt": ppt_module,
+    ".pptx": pptx_module,  # 추가
     ".xls": xls_module,
+    ".xlsx": xlsx_module,  # 추가
     ".hwp": hwp_module,
+    ".hwpx": hwpx_module,  # 추가
     ".pdf": pdf_module,
 }
 
