@@ -57,9 +57,9 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
             # 탭 → 공백
             if c == "\t":
                 c = " "
-            # CR/LF 정규화: \r?\n → \n  (여기서는 이미 원문 문자 단위에서 처리)
+            # CR/LF 정규화:
             if c == "\r":
-                continue
+                c = "\n"
 
             # 연속 공백 압축 (줄바꿈 제외)
             if c == " ":
@@ -75,3 +75,4 @@ def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
 
     text = "".join(out_chars)
     return text, index_map
+

@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import struct
 import tempfile
 import olefile
@@ -10,7 +11,7 @@ from server.core.matching import find_sensitive_spans
 
 
 # ========== CONFIG ==========
-DEBUG = False
+DEBUG = True
 # ============================
 
 
@@ -142,6 +143,30 @@ def extract_text(file_bytes: bytes) -> dict:
 
 
 # ─────────────────────────────
+# 탐지 span 보정(분리)
+# ─────────────────────────────
+def _split_cross_paragraph_matches(matches, text):
+    """\r\r 또는 \n\n 문단 경계를 포함한 매치를 자동으로 분리"""
+    new_matches = []
+    for s, e, val, meta in matches:
+        snippet = text[s:e]
+        # 문단 경계 포함 여부
+        if "\r\r" in snippet or "\n\n" in snippet:
+            # 두 개 이상 개행 기준으로 분리
+            parts = re.split(r'[\r\n]{2,}', snippet)
+            cp_cursor = s
+            for part in parts:
+                if not part.strip():
+                    cp_cursor += len(part) + 2
+                    continue
+                new_matches.append((cp_cursor, cp_cursor + len(part), part, meta))
+                cp_cursor += len(part) + 2
+        else:
+            new_matches.append((s, e, val, meta))
+    return new_matches
+
+
+# ─────────────────────────────
 # 바이트 치환 (레닥션)
 # ─────────────────────────────
 def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replacement_char: str = "*") -> bytes:
@@ -154,17 +179,32 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
         plcpcd = _extract_plcpcd(_get_clx_data(word_data, table_data) or b"")
         pieces = _parse_plcpcd(plcpcd)
 
+
         # CP 누적 계산
         piece_spans = []
         cur = 0
+
         for p in pieces:
             fc_base = p["fc"]
             bpc = 1 if p["fCompressed"] else 2
-            chunk = word_data[p["fc"]:p["fc"] + p["byte_count"]]
-            text = _decode_piece(chunk, p["fCompressed"])
-            char_len = len(text)
-            piece_spans.append((cur, cur + char_len, fc_base, bpc))
-            cur += char_len
+            start, end = p["fc"], p["fc"] + p["byte_count"]
+            text = _decode_piece(word_data[start:end], p["fCompressed"])
+
+            cp_len = p["cp_end"] - p["cp_start"]
+            dec_len = len(text)
+            diff = cp_len - dec_len
+
+            if diff != 0 and abs(diff) <= 5:
+                if DEBUG:
+                    print(f"[CP-MISMATCH] piece#{p['index']} diff={diff} (cp_len={cp_len}, dec_len={dec_len})")
+
+            text_start = cur
+            text_end = cur + cp_len
+            piece_spans.append((text_start, text_end, fc_base, bpc))
+
+            # diff를 다음 cur에 누적
+            cur += cp_len + (diff if abs(diff) <= 5 else 0)
+
 
         if DEBUG:
             print("\n[DEBUG] TARGET 목록")
@@ -247,6 +287,10 @@ def redact(file_bytes: bytes) -> bytes:
 
         norm_text, index_map = normalization_index(raw_text)
         matches = find_sensitive_spans(norm_text)
+
+        # 헤더/바닥글 경계(\r\r, \n\n) 넘는 매치는 분리
+        matches = _split_cross_paragraph_matches(matches, norm_text)
+
         if not matches:
             print("[INFO] 민감정보 없음 → 원본 반환")
             return file_bytes
