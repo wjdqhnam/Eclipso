@@ -4,7 +4,10 @@ import io, zipfile, time
 from typing import List, Tuple
 from fastapi import HTTPException
 from server.core.schemas import XmlScanResponse
-from server.modules.xml_redaction import docx, xlsx, pptx, hwpx
+from server.modules import docx_module as docx
+from server.modules import xlsx_module as xlsx
+from server.modules import pptx_module as pptx
+from server.modules import hwpx_module as hwpx
 from server.modules.common import compile_rules
 
 def detect_xml_type(filename: str) -> str:
