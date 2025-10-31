@@ -12,6 +12,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 라우터 등록
 app.include_router(text_api.router)
 app.include_router(redaction_api.router)
 app.include_router(file_redact_api.router)
