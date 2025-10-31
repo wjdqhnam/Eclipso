@@ -3,6 +3,6 @@ venv/
 __pycache__/
 *.pyc
 
-#file ignore
+# 문서파일 ignore
 근희함.doc
 test.doc

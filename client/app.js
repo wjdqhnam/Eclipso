@@ -43,16 +43,22 @@ async function renderPdfPreview(file) {
 
 // 스캔 실행
 $('#btn-scan')?.addEventListener('click', async () => {
-  const f = $('#file').files[0]
+  const f = $('#file').files[0]         //  파일 먼저 가져오기
   if (!f) return alert('파일을 선택하세요')
 
+  const ext = f.name.split('.').pop().toLowerCase()  //  확장자 추출
+  const fileName = f.name
+    ? f.name.replace(/\.[^.]+$/, `_redacted.${ext}`)
+    : `redacted.${ext}`
+
+  __lastRedactedName = fileName
+
   $('#status').textContent = '텍스트 추출 및 매칭 중...'
+
   const fd = new FormData()
   fd.append('file', f)
-  const ext = f.name.split('.').pop().toLowerCase()
 
   try {
-    // 텍스트 추출
     const extResp = await fetch(`${API_BASE()}/text/extract`, { method: 'POST', body: fd })
     if (!extResp.ok) {
       const msg = await extResp.text()
@@ -60,7 +66,6 @@ $('#btn-scan')?.addEventListener('click', async () => {
     }
     const extData = await extResp.json()
 
-    // 매칭
     const rules = $$('input[name="rule"]:checked').map(x => x.value)
     const matchResp = await fetch(`${API_BASE()}/text/match`, {
       method: 'POST',
@@ -76,7 +81,7 @@ $('#btn-scan')?.addEventListener('click', async () => {
     $('#text-preview-block').classList.remove('hidden')
     $('#txt-out').value = extData.full_text || ''
 
-    // 결과표 표시
+    // 결과표
     $('#match-result-block').classList.remove('hidden')
     const tbody = $('#result-rows')
     tbody.innerHTML = ''
@@ -86,7 +91,9 @@ $('#btn-scan')?.addEventListener('click', async () => {
       tr.innerHTML = `
         <td class="py-2 px-2 mono">${r.rule}</td>
         <td class="py-2 px-2 mono">${r.value}</td>
-        <td class="py-2 px-2 ${r.valid ? 'text-emerald-700' : 'text-rose-700'}">${r.valid ? 'OK' : 'FAIL'}</td>
+        <td class="py-2 px-2 ${r.valid ? 'text-emerald-700' : 'text-rose-700'}">
+          ${r.valid ? 'OK' : 'FAIL'}
+        </td>
         <td class="py-2 px-2 mono context">${r.context || ''}</td>`
       tbody.appendChild(tr)
     }
@@ -98,31 +105,31 @@ $('#btn-scan')?.addEventListener('click', async () => {
 
     // === 레닥션 파일 생성 ===
     $('#status').textContent = '레닥션 파일 생성 중...'
-    const redactResp = await fetch(`${API_BASE()}/redact/file`, {
-      method: 'POST',
-      body: fd,
-    })
+    const redactResp = await fetch(`${API_BASE()}/redact/file`, { method: 'POST', body: fd })
     if (!redactResp.ok) throw new Error(`레닥션 실패 (${redactResp.status})`)
 
     const blob = await redactResp.blob()
     const contentType = redactResp.headers.get('Content-Type') || 'application/octet-stream'
-    const disp = redactResp.headers.get('Content-Disposition') || ''
-    const matchName = disp.match(/filename="?([^"]+)"?/)
-    const fileName = matchName ? matchName[1] : `redacted.${ext}`
+
+    const originalName = f.name || ''
+    const extMatch = originalName.match(/\.([^.]+)$/)
+    const extName = extMatch ? extMatch[1] : (ext || 'bin')
+    const safeBase = originalName.replace(/\.[^.]+$/, '') || 'redacted'
+    const finalName = `${safeBase}.${extName}`
 
     __lastRedactedBlob = new Blob([blob], { type: contentType })
-    __lastRedactedName = fileName
+    __lastRedactedName = finalName
 
     const btn = $('#btn-save-redacted')
     btn.classList.remove('hidden')
     btn.disabled = false
     $('#status').textContent = '레닥션 완료 — 다운로드 가능'
-
   } catch (err) {
     console.error(err)
-    $('#status').textContent = `❌ 오류: ${err.message}`
+    $('#status').textContent = `오류: ${err.message}`
   }
 })
+
 
 // 다운로드 버튼
 $('#btn-save-redacted')?.addEventListener('click', () => {

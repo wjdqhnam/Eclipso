@@ -12,7 +12,8 @@ def strip_invisible(s: str) -> str:
     s = _NBSP.sub(" ", s)
     return s
 
-def normalize_text(s: str | None) -> str:
+#매핑 필요없는 곳에 사용하는 단순 정규화 방식
+def normalization_text(s: str | None) -> str:
     if not s: return ""
     s = unicodedata.normalize("NFKC", s)
     s = re.sub(r"\r\n?", "\n", s)
@@ -22,3 +23,56 @@ def normalize_text(s: str | None) -> str:
     s = re.sub(r"[ \f\v]+", " ", s)
     s = "\n".join(re.sub(r"[ \t]+$", "", line) for line in s.split("\n"))
     return s
+
+#정규화된 문자열과 원문 인덱스 매핑한 맵을 반환함.
+# dict: {정규화된 인덱스: 원문 인덱스}
+def normalization_index(s: str | None) -> tuple[str, dict[int, int]]:
+    if not s:
+        return "", {}
+
+    out_chars: list[str] = []
+    index_map: dict[int, int] = {}
+    norm_i = 0
+    prev_space = False
+
+    for i, ch in enumerate(s):
+        # 1) NFKC
+        norm = unicodedata.normalize("NFKC", ch)
+
+        # 2) 제로폭 제거
+        if _ZERO_WIDTH.match(norm):
+            if out_chars:
+                index_map[len(out_chars)] = i
+            continue
+
+        # 3) NBSP류 → ' '
+        norm = _NBSP.sub(" ", norm)
+        if out_chars:
+            index_map[len(out_chars)] = i
+
+        # 4) 대시류 → '-'
+        norm = _DASHES.sub("-", norm)
+
+        for c in norm:
+            # 탭 → 공백
+            if c == "\t":
+                c = " "
+            # CR/LF 정규화:
+            if c == "\r":
+                c = "\n"
+
+            # 연속 공백 압축 (줄바꿈 제외)
+            if c == " ":
+                if prev_space:
+                    continue
+                prev_space = True
+            else:
+                    prev_space = False
+
+            out_chars.append(c)
+            index_map[norm_i] = i
+            norm_i += 1
+
+    text = "".join(out_chars)
+    return text, index_map
+
