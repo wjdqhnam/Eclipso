@@ -1,10 +1,9 @@
-from fastapi import APIRouter, UploadFile, File, Response, HTTPException, Form
+from fastapi import APIRouter, UploadFile, File, Response, HTTPException
 from pathlib import Path
 
 from server.modules import doc_module, hwp_module, ppt_module, xls_module, pdf_module
 from server.modules.xml_redaction import xml_redact_to_file
 
-# 🔽 NER/정규식 병합을 위해 추가 (기존 main에는 없던 import)
 from server.core.regex_utils import match_text
 from server.modules.ner_module import run_ner
 from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
@@ -15,14 +14,20 @@ import traceback
 
 router = APIRouter(prefix="/redact", tags=["redact"])
 
-@router.post("/file", response_class=Response)
+@router.post(
+    "/file",
+    response_class=Response,
+    summary="파일 레닥션",
+    description=(
+        "지원 포맷: .doc, .hwp, .ppt, .xls, .pdf, .docx, .pptx, .xlsx, .hwpx\n"
+    ),
+)
 async def redact_file(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
     file_bytes = await file.read()
 
     out = None
     mime = "application/octet-stream"
-    # ✅ main과 동일: 원본 파일명 유지(한글 인코딩 처리)
     encoded_fileName = file.filename.encode("utf-8", "ignore").decode("latin-1", "ignore")
 
     try:
@@ -43,7 +48,6 @@ async def redact_file(file: UploadFile = File(...)):
             mime = "application/vnd.ms-excel"
 
         elif ext == ".pdf":
-            # ✅ main 유지 + NER/정규식 병합만 추가
             import fitz  # PyMuPDF
 
             try:
@@ -61,7 +65,6 @@ async def redact_file(file: UploadFile = File(...)):
             regex_spans = []
             for it in (regex_res.get("items", []) or []):
                 s, e = it.get("start"), it.get("end")
-                # 0 인덱스도 허용하면서 유효 구간만
                 if s is not None and e is not None and e > s:
                     regex_spans.append({
                         "start": int(s),
@@ -82,7 +85,6 @@ async def redact_file(file: UploadFile = File(...)):
             mime = "application/pdf"
 
         elif ext in (".docx", ".pptx", ".xlsx", ".hwpx"):
-            # ✅ main 그대로: XML 기반 레닥션 파이프
             with tempfile.TemporaryDirectory() as tmpdir:
                 src_path = os.path.join(tmpdir, f"src{ext}")
                 dst_path = os.path.join(tmpdir, f"dst{ext}")
@@ -99,14 +101,13 @@ async def redact_file(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        print("🔥 [레닥션 오류 발생]")
+        print(" [레닥션 오류 발생]")
         traceback.print_exc()
         raise HTTPException(500, f"{ext} 처리 중 오류: {e}")
 
     if not out:
         raise HTTPException(500, f"{ext} 레닥션 실패: 출력 없음")
 
-    # ✅ main 그대로: 원본 파일명 유지 + 인코딩 헤더
     return Response(
         content=out,
         media_type=mime,
