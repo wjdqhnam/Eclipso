@@ -1,27 +1,42 @@
-# server/xml/common.py
+# server/modules/common.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import io, re, zipfile, xml.etree.ElementTree as ET
-from typing import Tuple, List, Dict
-from ..core.redaction_rules import PRESET_PATTERNS, RULES
+import io
+import re
+import zipfile
+from typing import List, Tuple, Optional, Callable
 
-# ---------- 옵션(HWPX에서 사용) ----------
-HWPX_STRIP_PREVIEW = True
-HWPX_DISABLE_CACHE = True
-HWPX_BLANK_PREVIEW = False
-HWPX_BLANK_OLE_BINDATA = False
+# 올바른 경로: server/core/redaction_rules.py
+try:
+    from ..core.redaction_rules import PRESET_PATTERNS, RULES
+except Exception:  # pragma: no cover
+    from server.core.redaction_rules import PRESET_PATTERNS, RULES  # type: ignore
 
-# ---------- 텍스트 정리 ----------
-_FOOTNOTE_PATTERNS = [
-    re.compile(r"\s*\(\^\d+\)"),
-    re.compile(r"\s*\^\d+\)"),
-    re.compile(r"\s*\^\d+\."),
-    re.compile(r"\s*\^\d+\b"),
+__all__ = [
+    # 공개 유틸
+    "cleanup_text",
+    "compile_rules",
+    "sub_text_nodes",
+    "chart_sanitize",
+    "chart_rels_sanitize",
+    "xlsx_text_from_zip",
+    "redact_embedded_xlsx_bytes",
+    # HWPX 옵션
+    "HWPX_STRIP_PREVIEW",
+    "HWPX_DISABLE_CACHE",
+    "HWPX_BLANK_PREVIEW",
 ]
+
+# ---------------- 옵션(환경변수 대체·기본값) ----------------
+HWPX_STRIP_PREVIEW = False
+HWPX_DISABLE_CACHE = True
+HWPX_BLANK_PREVIEW = True
+
+# ---------------- 공통 유틸 ----------------
 def cleanup_text(text: str) -> str:
-    if not text: return ""
-    t = text
-    for rx in _FOOTNOTE_PATTERNS: t = rx.sub("", t)
-    t = re.sub(r"[\x00-\x09\x0B-\x1F]", " ", t)
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
@@ -30,211 +45,276 @@ def cleanup_text(text: str) -> str:
 # ---------- 룰 컴파일 + 우선순위 ----------
 _RULE_PRIORITY = {
     "card": 100, "email": 90, "rrn": 80, "fgn": 80,
-    "phone_mobile": 60, "phone_city": 60, "phone_service": 60,
+    "phone_mobile": 60, "phone_city": 60,
     "driver_license": 40, "passport": 30,
 }
-def compile_rules():
-    comp = []
+
+
+def compile_rules() -> List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]]:
+    """
+    PRESET_PATTERNS + RULES 기반으로 레닥션용 규칙을 컴파일한다.
+
+    반환 형식:
+        [
+          (name, compiled_regex, need_valid, priority, validator),
+          ...
+        ]
+
+    - need_valid:
+        * PRESET_PATTERNS에 ensure_valid가 명시되어 있으면 그 값을 사용
+        * 그렇지 않고 RULES에 validator가 있으면 기본적으로 True
+        * validator도 없고 ensure_valid도 없으면 False
+    """
+    comp: List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]] = []
+
     for r in PRESET_PATTERNS:
-        name = r["name"]; pat = r["regex"]
+        name = r["name"]
+        pat = r["regex"]
+
+        # 대소문자 옵션
         flags = 0 if r.get("case_sensitive") else re.IGNORECASE
-        if r.get("whole_word"): pat = rf"\b(?:{pat})\b"
+
+        # whole_word 옵션
+        if r.get("whole_word"):
+            pat = rf"\b(?:{pat})\b"
+
+        # 우선순위
         prio = _RULE_PRIORITY.get(name, 0)
-        comp.append((name, re.compile(pat, flags), bool(r.get("ensure_valid", False)), prio))
+
+        # RULES에서 validator 가져오기 (키는 소문자 기준)
+        rule_key = (name or "").lower()
+        validator = RULES.get(rule_key, {}).get("validator")
+        validator = validator if callable(validator) else None
+
+        # need_valid 계산
+        ensure_valid_flag = r.get("ensure_valid", None)
+        if ensure_valid_flag is None:
+            # ensure_valid 명시 X → validator가 있으면 기본적으로 검증
+            need_valid = validator is not None
+        else:
+            need_valid = bool(ensure_valid_flag)
+
+        comp.append(
+            (name, re.compile(pat, flags), need_valid, prio, validator)
+        )
+
+    # 우선순위 높은 순
     comp.sort(key=lambda t: t[3], reverse=True)
     return comp
 
-def is_valid(kind: str, value: str) -> bool:
-    rule = RULES.get((kind or "").lower())
-    if rule:
-        validator = rule.get("validator")
-        if callable(validator):
-            try: return bool(validator(value))
-            except TypeError: return bool(validator(value, None))
-    return True
 
-# ---------- 마스킹 유틸 ----------
-def _mask_keep_seps(s: str) -> str:
-    return "".join("*" if ch.isalnum() else ch for ch in s)
+def _is_valid(value: str, validator: Optional[Callable]) -> bool:
+    if not validator:
+        return True
+    try:
+        try:
+            return bool(validator(value))
+        except TypeError:
+            return bool(validator(value, None))
+    except Exception:
+        return False
+
+# ---------- 마스킹(엔티티 보존) ----------
+_ENTITY_RE = re.compile(r"&(#\d+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);")
+
+def _mask_preserving_entities(v: str, mask_char_fn) -> str:
+    """XML 엔티티(&...;) 토큰은 원형 유지, 나머지 문자만 mask_char_fn으로 치환."""
+    out: List[str] = []
+    i = 0
+    n = len(v)
+    while i < n:
+        if v[i] == "&":
+            m = _ENTITY_RE.match(v, i)
+            if m:
+                out.append(v[i:m.end()])
+                i = m.end()
+                continue
+        out.append(mask_char_fn(v[i]))
+        i += 1
+    return "".join(out)
+
+
 def _mask_email(v: str) -> str:
-    return "".join(ch if ch == "@" else "*" for ch in v)
-def mask_for(rule: str, v: str) -> str:
-    return _mask_email(v) if (rule or "").lower()=="email" else _mask_keep_seps(v)
+    def _mask(ch: str) -> str:
+        if ch in ("@", "-"):
+            return ch
+        if ch.isalnum() or ch in "._":
+            return "*"
+        return ch
+    return _mask_preserving_entities(v, _mask)
 
-def mask_text_with_priority(txt: str, comp) -> tuple[str, int]:
-    if not txt: return "", 0
-    taken: List[tuple[int,int]] = []; repls: List[tuple[int,int,str]] = []
-    def ov(a0,a1,b0,b1): return not (a1<=b0 or b1<=a0)
-    for name, rx, need_valid, _prio in comp:
-        for m in rx.finditer(txt):
-            s,e = m.span()
-            if any(ov(s,e,ts,te) for ts,te in taken): continue
+
+def _mask_keep_rules(v: str) -> str:
+    """공통: '-' 보존, 영숫자 및 '.' '_' 가림, 나머지 기호/공백 보존."""
+    def _mask(ch: str) -> str:
+        if ch == "-":
+            return ch
+        if ch.isalnum() or ch in "._":
+            return "*"
+        return ch
+    return _mask_preserving_entities(v, _mask)
+
+
+def _mask_value(rule: str, v: str) -> str:
+    return _mask_email(v) if (rule or "").lower() == "email" else _mask_keep_rules(v)
+
+# ---------- 2-패스 토큰 스캔 유틸 ----------
+
+def _collect_spans(src: str, comp) -> tuple[List[tuple], List[tuple]]:
+    """허용 구간(OK)과 금지 구간(FAIL)을 수집."""
+    allowed: List[tuple] = []   # (s, e, rule, prio)
+    forbidden: List[tuple] = [] # (s, e)
+    for name, rx, need_valid, prio, validator in comp:
+        for m in rx.finditer(src):
+            s, e = m.span()
             val = m.group(0)
-            if need_valid and not is_valid(name, val): continue
-            taken.append((s,e)); repls.append((s,e, mask_for(name, val)))
-    if not repls: return txt, 0
-    repls.sort(key=lambda r:r[0], reverse=True)
-    out = list(txt)
-    for s,e,rep in repls: out[s:e] = list(rep)
-    return "".join(out), len(repls)
+            if need_valid and not _is_valid(val, validator):
+                # FAIL → 토큰 전체 보호
+                forbidden.append((s, e))
+            else:
+                allowed.append((s, e, name, prio))
+    return allowed, forbidden
 
-# ---------- XML 텍스트 노드 치환 ----------
-_TEXT_NODE_RE = re.compile(r">(?!\s*<)([^<]+)<", re.DOTALL)
-def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes,int]:
-    s = xml_bytes.decode("utf-8", "ignore")
-    def _apply(txt: str) -> str:
-        masked, _ = mask_text_with_priority(txt, comp); return masked
-    out = _TEXT_NODE_RE.sub(lambda m: ">" + _apply(m.group(1)) + "<", s)
-    return out.encode("utf-8","ignore"), 0
 
-# ---------- 인코딩/ET ----------
-def _detect_xml_encoding(b: bytes) -> str:
-    m = re.match(rb'^<\?xml[^>]*encoding=["\']([^"\']+)["\']', b.strip()[:200], re.I)
-    if m:
-        enc = m.group(1).decode("ascii","ignore")
-        enc_low = enc.lower().replace("-","").replace("_","")
-        return "utf-8" if enc_low in ("utf8","utf") else enc
-    return "utf-8"
-def et_from_bytes(xml_bytes: bytes) -> tuple[ET.ElementTree,str]:
-    enc = _detect_xml_encoding(xml_bytes)
-    try: s = xml_bytes.decode(enc, "strict")
-    except Exception: s = xml_bytes.decode(enc, "ignore")
-    return ET.ElementTree(ET.fromstring(s)), enc
-def et_to_bytes(tree: ET.ElementTree, enc: str) -> bytes:
-    bio = io.BytesIO(); tree.write(bio, encoding=enc, xml_declaration=True); return bio.getvalue()
+def _overlap(a0, a1, b0, b1) -> bool:
+    return not (a1 <= b0 or b1 <= a0)
 
-# ---------- 차트 무해화(레이아웃 유지) ----------
-_NS = {
-    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-}
-_C_EXTERNAL_RE = re.compile(rb"(?is)<\s*c:externalData\b[^>]*>.*?</\s*c:externalData\s*>")
-def _strip_chart_external_data(xml_bytes: bytes) -> tuple[bytes,int]:
-    after = _C_EXTERNAL_RE.sub(b"", xml_bytes); return (after,1) if after!=xml_bytes else (xml_bytes,0)
 
-def chart_sanitize(xml_bytes: bytes, comp) -> tuple[bytes,int]:
-    b2, ext = _strip_chart_external_data(xml_bytes)
-    tree, enc = et_from_bytes(b2); root = tree.getroot(); hits = ext
-    for f in root.findall(".//c:f", _NS):
-        if f.text: f.text = ""; hits += 1
-    # strCache
-    for v in root.findall(".//c:strCache//c:pt/c:v", _NS):
-        if v.text is not None:
-            new, cnt = mask_text_with_priority(v.text, comp)
-            if cnt: v.text = new; hits += cnt
-    # numCache
-    for v in root.findall(".//c:numCache//c:pt/c:v", _NS):
-        if v.text is not None:
-            new, cnt = mask_text_with_priority(v.text, comp)
-            if cnt: v.text = new; hits += cnt
-    # labels
-    for t in root.findall(".//a:t", _NS):
-        if t.text:
-            new, cnt = mask_text_with_priority(t.text, comp)
-            if cnt: t.text = new; hits += cnt
-    return et_to_bytes(tree, enc), hits
-
-# ---------- XLSX 텍스트 수집(공유) ----------
-def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
+def _filter_allowed_by_forbidden(allowed, forbidden):
+    if not forbidden:
+        return allowed
     out = []
-    for name in zipf.namelist():
-        if name == "xl/sharedStrings.xml" or name.startswith("xl/worksheets/"):
-            try:
-                xml = zipf.read(name).decode("utf-8","ignore")
-                out += [m.group(1) for m in re.finditer(r">([^<>]+)<", xml)]
-            except KeyError: pass
-    for name in (n for n in zipf.namelist() if n.startswith("xl/charts/") and n.endswith(".xml")):
-        s = zipf.read(name).decode("utf-8","ignore")
-        for m in re.finditer(r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>", s, re.I|re.DOTALL):
-            v = (m.group(1) or m.group(2) or "").strip()
-            if v: out.append(v)
+    for s, e, nm, pr in allowed:
+        if any(_overlap(s, e, fs, fe) for fs, fe in forbidden):
+            continue
+        out.append((s, e, nm, pr))
+    return out
+
+
+def _apply_spans(src: str, allowed) -> tuple[str, int]:
+    if not allowed:
+        return src, 0
+    # 시작 오름차순, 우선순위 내림차순, 길이 내림차순
+    allowed.sort(key=lambda t: (t[0], -t[3], -(t[1] - t[0])))
+    out = list(src)
+    hits = 0
+    # 뒤에서 앞으로 치환(오프셋 무관)
+    for s, e, nm, _pr in sorted(allowed, key=lambda t: t[0], reverse=True):
+        seg = src[s:e]
+        out[s:e] = list(_mask_value(nm, seg))
+        hits += 1
+    return "".join(out), hits
+
+# ---------- 핵심: 텍스트 노드만 마스킹하는 2-패스 ----------
+
+_TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.DOTALL)
+
+def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
+    """
+    XML(UTF-8 가정)에서 **태그 밖 텍스트 노드만** 토큰 단위로 2-패스 마스킹.
+
+    - 태그/속성(예: <c r="A1">, <row r="3">, 관계 ID 등)은 절대 건드리지 않음
+    - 엑셀 구조 깨짐 / 복구 팝업 방지용
+    """
+    s = xml_bytes.decode("utf-8", "ignore")
+
+    all_allowed: List[tuple] = []
+    all_forbidden: List[tuple] = []
+
+    # 각각의 "텍스트 구간"에 대해서만 룰을 적용하고,
+    # 전역 문자열 오프셋으로 다시 합친다.
+    for m in _TEXT_NODE_RE.finditer(s):
+        txt = m.group(1)
+        if not txt:
+            continue
+        base = m.start(1)  # 이 텍스트 구간의 전역 시작 인덱스
+
+        allowed, forbidden = _collect_spans(txt, comp)
+
+        # 전역 오프셋으로 변환해서 모아둔다.
+        for a_s, a_e, nm, pr in allowed:
+            all_allowed.append((base + a_s, base + a_e, nm, pr))
+        for f_s, f_e in forbidden:
+            all_forbidden.append((base + f_s, base + f_e))
+
+    all_allowed = _filter_allowed_by_forbidden(all_allowed, all_forbidden)
+    masked, hits = _apply_spans(s, all_allowed)
+    return masked.encode("utf-8", "ignore"), hits
+
+# ---------- 차트 관련 ----------
+
+def chart_rels_sanitize(rels_bytes: bytes) -> Tuple[bytes, int]:
+    # 현재는 noop. 향후 dangling 관계 정리 로직을 넣을 수 있음.
+    return rels_bytes, 0
+
+
+def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
+    """차트 XML도 동일 정책으로 텍스트만 마스킹."""
+    return sub_text_nodes(xml_bytes, comp)
+
+# ---------- DOCX [Content_Types].xml 보정(스텁) ----------
+def sanitize_docx_content_types(xml_bytes: bytes) -> bytes:
+    return xml_bytes
+
+# ---------- XLSX 텍스트 수집 ----------
+def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
+    out: List[str] = []
+    try:
+        sst = zipf.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
+        out += [m.group(1) for m in re.finditer(r"<t[^>]*>(.*?)</t>", sst, re.DOTALL)]
+    except KeyError:
+        pass
+
+    for name in (
+        n for n in zipf.namelist()
+        if n.startswith("xl/worksheets/") and n.endswith(".xml")
+    ):
+        try:
+            xml = zipf.read(name).decode("utf-8", "ignore")
+            out += [m.group(1) for m in re.finditer(r"<v[^>]*>(.*?)</v>", xml, re.DOTALL)]
+            out += [m.group(1) for m in re.finditer(r"<t[^>]*>(.*?)</t>", xml, re.DOTALL)]
+        except KeyError:
+            continue
+
+    for name in (
+        n for n in zipf.namelist()
+        if n.startswith("xl/charts/") and n.endswith(".xml")
+    ):
+        try:
+            s2 = zipf.read(name).decode("utf-8", "ignore")
+            for m in re.finditer(
+                r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>",
+                s2,
+                re.I | re.DOTALL,
+            ):
+                v = (m.group(1) or m.group(2) or "").strip()
+                if v:
+                    out.append(v)
+        except KeyError:
+            continue
+
     return cleanup_text("\n".join(out))
 
-# ---------- 내장 XLSX 레닥션(공유) ----------
+# ---------- OOXML 내장 XLSX 레닥션 ----------
 def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
+    """
+    OOXML(예: docx/pptx) 안에 포함된 .xlsx를 레닥션.
+    구조(relationship, 주소 등)를 건드리지 않고 텍스트 노드만 마스킹한다.
+    """
     comp = compile_rules()
-    bio_in = io.BytesIO(xlsx_bytes); bio_out = io.BytesIO()
-    with zipfile.ZipFile(bio_in,"r") as zin, zipfile.ZipFile(bio_out,"w",zipfile.ZIP_DEFLATED) as zout:
+    bio_in = io.BytesIO(xlsx_bytes)
+    bio_out = io.BytesIO()
+    with zipfile.ZipFile(bio_in, "r") as zin, \
+         zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
-            name = it.filename; data = zin.read(name); low = name.lower()
+            name = it.filename
+            data = zin.read(name)
+            low = name.lower()
             if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
                 data, _ = sub_text_nodes(data, comp)
             elif low.startswith("xl/charts/") and low.endswith(".xml"):
                 data, _ = chart_sanitize(data, comp)
+            elif low.startswith("xl/charts/_rels/") and low.endswith(".rels"):
+                data, _ = chart_rels_sanitize(data)
             zout.writestr(it, data)
     return bio_out.getvalue()
-
-# ---------- OLE 보수 마스킹(공유) ----------
-_PHONE_ASCII_RX = re.compile(rb'(?<!\d)\d{2,4}\s*-\s*\d{3,4}\s*-\s*\d{4}(?!\d)')
-_EMAIL_ASCII_RX = re.compile(rb'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
-_CARD_ASCII_RX  = re.compile(rb'(?<!\d)\d{4}(?:\s*-\s*|\s)\d{4}(?:\s*-\s*|\s)\d{4}(?:\s*-\s*|\s)\d{4}(?!\d)')
-_PHONE_U16_RX   = re.compile(rb'(?:(?<!\x00\d)\d\x00){2,4}\s?\x00-\x00\s?\x00(?:(?:\d\x00){3,4})\s?\x00-\x00\s?\x00(?:(?:\d\x00){4})(?!\x00\d)')
-_EMAIL_U16_RX   = re.compile(rb'(?:[A-Za-z0-9._%+\-]\x00)+@\x00(?:[A-Za-z0-9.\-]\x00)+\.\x00(?:[A-Za-z]{2,}\x00)')
-_CARD_U16_RX    = re.compile(
-    rb'(?:(?:\d\x00){4})(?:\s?\x00-\x00\s?\x00|\s\x00)'
-    rb'(?:(?:\d\x00){4})(?:\s?\x00-\x00\s?\x00|\s\x00)'
-    rb'(?:(?:\d\x00){4})(?:\s?\x00-\x00\s?\x00|\s\x00)'
-    rb'(?:(?:\d\x00){4})(?!\x00)'
-)
-def _mask_ascii_span(buf: bytearray, s: int, e: int, keep_at=False):
-    for i in range(s,e):
-        b = buf[i]
-        if 48<=b<=57 or 65<=b<=90 or 97<=b<=122: buf[i] = 0x2A
-        elif keep_at and b==64: pass
-def _mask_utf16le_span(buf: bytearray, s: int, e: int, keep_at=False):
-    for i in range(s,e,2):
-        lo, hi = buf[i], buf[i+1]
-        if hi==0x00:
-            if (0x30<=lo<=0x39) or (0x41<=lo<=0x5A) or (0x61<=lo<=0x7A): buf[i],buf[i+1]=0x2A,0x00
-            elif keep_at and lo==0x40: pass
-def _mask_regex_ascii(buf: bytearray, rx: re.Pattern, keep_at=False) -> int:
-    hits=0; bnow=bytes(buf)
-    for m in list(rx.finditer(bnow)): _mask_ascii_span(buf,m.start(),m.end(),keep_at); hits+=1
-    return hits
-def _mask_regex_u16(buf: bytearray, rx: re.Pattern, keep_at=False) -> int:
-    hits=0; bnow=bytes(buf)
-    for m in list(rx.finditer(bnow)): _mask_utf16le_span(buf,m.start(),m.end(),keep_at); hits+=1
-    return hits
-
-def redact_ole_conservative(data: bytes) -> bytes:
-    b = bytearray(data)
-    # ASCII 덩어리
-    ascii_chunks = []; start=None
-    for i, by in enumerate(b):
-        if 32<=by<=126:
-            if start is None: start=i
-        else:
-            if start is not None and (i-start)>=6: ascii_chunks.append((start,i))
-            start=None
-    if start is not None and (len(b)-start)>=6: ascii_chunks.append((start,len(b)))
-    comp = compile_rules()
-    def _red_str(txt: str) -> str:
-        new, _ = mask_text_with_priority(txt, comp); return new
-    for s,e in ascii_chunks:
-        try: txt = bytes(b[s:e]).decode('ascii','ignore')
-        except Exception: continue
-        nb = _red_str(txt).encode('ascii','ignore')
-        if len(nb) < (e-s): nb = nb + b'*'*((e-s)-len(nb))
-        elif len(nb) > (e-s): nb = nb[:(e-s)]
-        b[s:e] = nb
-    # UTF-16LE 덩어리
-    i=0; n=len(b)
-    while i+4<=n:
-        j=i; good=0
-        while j+1<n and (32<=b[j]<=126) and b[j+1]==0x00: good+=1; j+=2
-        if good>=4:
-            s,e=i,j
-            try: txt = bytes(b[s:e]).decode('utf-16le','ignore')
-            except Exception: i=j; continue
-            nb = _red_str(txt).encode('utf-16le','ignore')
-            if len(nb) < (e-s): nb = nb + b'\x2A\x00'*(((e-s)-len(nb))//2)
-            elif len(nb) > (e-s): nb = nb[:(e-s)]
-            b[s:e] = nb; i=j
-        else: i+=2
-    _mask_regex_ascii(b, _PHONE_ASCII_RX)
-    _mask_regex_u16(b, _PHONE_U16_RX)
-    _mask_regex_ascii(b, _EMAIL_ASCII_RX, keep_at=True)
-    _mask_regex_u16(b, _EMAIL_U16_RX, keep_at=True)
-    _mask_regex_ascii(b, _CARD_ASCII_RX)
-    _mask_regex_u16(b, _CARD_U16_RX)
-    return bytes(b)
