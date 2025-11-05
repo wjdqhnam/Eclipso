@@ -1,3 +1,4 @@
+# server/modules/xlsx_module.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import io, zipfile
@@ -48,10 +49,17 @@ def xlsx_text(zipf: zipfile.ZipFile) -> str:
     return xlsx_text_from_zip(zipf)
 
 
-def extract_text(file_bytes: bytes) -> str:
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+def extract_text(file_bytes: bytes) -> dict:
     """바이트로 들어온 XLSX에서 텍스트만 추출."""
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
-        return xlsx_text(zipf)
+        txt = xlsx_text(zipf)
+    return {
+        "full_text": txt,
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
+    }
 
 
 def _get_validator(rule_name: str):
@@ -65,8 +73,6 @@ def _get_validator(rule_name: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보를 추출
-#  - compile_rules() 반환형(3튜플/4튜플/네임드 객체)을 모두 허용하는 유연 언팩
-#  - RULES의 validator를 불러 실제 valid 여부를 채움
 # ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = xlsx_text(zipf)
@@ -137,7 +143,7 @@ def redact_item(filename: str, data: bytes, comp):
         b2, _ = chart_sanitize(data, comp)
         return b2
 
-    # 3) 차트 관계(.rels): dangling/미사용 참조 정리(복구 팝업 방지) — 현재 스텁
+    # 3) 차트 관계(.rels)
     if low.startswith("xl/charts/_rels/") and low.endswith(".rels"):
         b3, _ = chart_rels_sanitize(data)
         return b3

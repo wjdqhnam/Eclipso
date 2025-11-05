@@ -98,6 +98,23 @@ def docx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(x for x in [text_main, text_charts] if x))
 
 
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+def extract_text(file_bytes: bytes) -> dict:
+    """
+    DOCX 바이트에서 텍스트만 추출.
+    full_text / pages 형식으로 반환 (HWPX extract_text와 동일 형식).
+    """
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+        txt = docx_text(zipf)
+
+    return {
+        "full_text": txt,
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보 추출
 #   - compile_rules()가 3/4/5튜플 또는 네임드 객체여도 동작하게 유연하게 처리
@@ -146,16 +163,11 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 파일 단위 레닥션: 각 파트별로 처리
-#   - [Content_Types].xml : 외부 링크/임베딩 타입 정리 (현재는 common에서 스텁)
-#   - word/document.xml   : 텍스트 노드만 마스킹
-#   - word/charts/*.xml   : 차트 텍스트 마스킹
-#   - word/charts/_rels/*.rels : 차트 관계 정리(복구 팝업 방지용, 현재 스텁)
-#   - word/embeddings/*.xlsx : 내부 XLSX까지 레닥션
 # ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
 
-    # 0) DOCX 루트 컨텐츠 타입 정리 (externalLinks 오버라이드 제거 등)
+    # 0) DOCX 루트 컨텐츠 타입 정리
     if low == "[content_types].xml":
         return sanitize_docx_content_types(data)
 
@@ -168,12 +180,12 @@ def redact_item(filename: str, data: bytes, comp):
         b2, _ = chart_sanitize(data, comp)
         return sub_text_nodes(b2, comp)[0]
 
-    # 3) 차트 RELS: 외부데이터/임베딩/외부링크 링크 정리(복구 팝업 방지)
+    # 3) 차트 RELS
     if low.startswith("word/charts/_rels/") and low.endswith(".rels"):
         b2, _ = chart_rels_sanitize(data)
         return b2
 
-    # 4) 임베디드 XLSX: 내부까지 무해화(외부 링크 제거 포함)
+    # 4) 임베디드 XLSX
     if low.startswith("word/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)
 

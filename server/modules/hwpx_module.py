@@ -48,6 +48,7 @@ log = logging.getLogger("xml_redaction")
 # ─────────────────────────────────────────────────────────────────────────────
 _CURRENT_SECRETS: List[str] = []
 
+
 def set_hwpx_secrets(values: List[str] | None):
     """레닥션 전에 수집된 민감 문자열(시크릿)을 저장한다."""
     global _CURRENT_SECRETS
@@ -129,7 +130,6 @@ def extract_text(file_bytes: bytes) -> dict:
     /text/extract 엔드포인트가 기대하는 형식으로 HWPX 텍스트를 반환.
     - full_text: 전체 텍스트
     - pages    : 페이지 배열 (HWPX는 페이지 개념이 없어 1페이지로 통합)
-    텍스트 미리보기에서 쓰레기값(XML 태그, 각주 마커, 시트 주소 등)을 최대한 제거한다.
     """
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         raw = hwpx_text(zipf)
@@ -186,7 +186,6 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
         # 일반적인 현재 리포 구조
         from ..core.redaction_rules import RULES
     except Exception:
-        # 일부 브랜치/옛 구조/절대경로 fallback
         try:
             from ..redaction_rules import RULES  # type: ignore
         except Exception:
@@ -261,17 +260,10 @@ def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
     """
     low = filename.lower()
 
-    # 1) Preview 폴더: 삭제 또는 블랭크
+    # 1) Preview 폴더: 내용 전부 제거 (텍스트/이미지 포함 전체 0바이트)
     if low.startswith("preview/"):
-        if HWPX_STRIP_PREVIEW:
-            return b""
-        if HWPX_BLANK_PREVIEW and low.endswith((".png", ".jpg", ".jpeg")):
-            # 1x1 PNG (고정 바이트)
-            return (
-                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-                b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0cIDATx\x9cc\x00\x01"
-                b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
-            )
+        # 프리뷰는 보안상 전부 날려 버린다.
+        return b""
 
     # 2) settings.xml: 캐시/프리뷰 비활성화
     if HWPX_DISABLE_CACHE and low.endswith("settings.xml"):
