@@ -4,160 +4,177 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
+
+    <!-- Tailwind & PDF.js -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-
     <script>
-      const origin = window.location.origin
-      if (origin.includes('127.0.0.1') || origin.includes('localhost')) {
-        window.API_BASE = 'http://127.0.0.1:8000'
+      // API_BASE 자동 결정 (로컬/배포 공용)
+      const origin = window.location.origin;
+      if (origin.includes("127.0.0.1") || origin.includes("localhost")) {
+        window.API_BASE = "http://127.0.0.1:8000";
       } else {
-        window.API_BASE = origin.replace(/\/$/, '')
+        window.API_BASE = origin.replace(/\/$/, "");
       }
 
+      // (옵션) HWPX 뷰어 URL 쓰고 싶으면 여기서 세팅 가능
+      window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || "";
+
+      // pdf.js 워커 설정
       pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
     </script>
 
     <style>
       .mono {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-          'Liberation Mono', 'Courier New', monospace;
+          "Liberation Mono", "Courier New", monospace;
       }
-      mark {
-        padding: 0 0.15rem;
-        border-radius: 0.2rem;
+      .pill {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 12px;
+        line-height: 1.2;
+        white-space: nowrap;
       }
     </style>
   </head>
+
   <body class="bg-gray-50 text-gray-900">
     <div class="max-w-7xl mx-auto p-6">
       <h1 class="text-2xl font-bold mb-4">Eclipso</h1>
+
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- 좌측 패널 -->
         <div class="bg-white rounded-2xl shadow p-5 space-y-4">
           <div>
             <label class="block text-sm font-semibold mb-1">파일 업로드</label>
             <input
               id="file"
               type="file"
-              accept=".pdf,.doc,.ppt,.xls,.hwp,.txt"
+              accept=".pdf,.doc,.ppt,.xls,.hwp,.docx,.xlsx,.pptx,.hwpx"
               class="block w-full border rounded p-2 bg-white"
             />
+            <p class="text-[12px] text-gray-500 mt-1">
+              PDF / DOC / PPT / XLS / HWP / DOCX / XLSX / PPTX / HWPX 지원
+            </p>
           </div>
 
           <fieldset class="border rounded p-3">
             <legend class="text-sm font-semibold">규칙 선택</legend>
-            <div id="rules-container">
-              <label class="block"
-                ><input type="checkbox" name="rule" value="rrn" checked />
-                주민등록번호</label
-              >
-              <label class="block"
-                ><input type="checkbox" name="rule" value="fgn" checked />
-                외국인등록번호</label
-              >
-              <label class="block"
-                ><input
-                  type="checkbox"
-                  name="rule"
-                  value="phone_mobile"
-                  checked
-                />
-                휴대전화</label
-              >
-              <label class="block"
-                ><input
-                  type="checkbox"
-                  name="rule"
-                  value="phone_city"
-                  checked
-                />
-                지역전화</label
-              >
-              <label class="block"
-                ><input type="checkbox" name="rule" value="email" checked />
-                이메일</label
-              >
-              <label class="block"
-                ><input type="checkbox" name="rule" value="card" checked />
-                카드번호</label
-              >
-              <label class="block"
-                ><input type="checkbox" name="rule" value="passport" checked />
-                여권번호</label
-              >
-              <label class="block"
-                ><input
-                  type="checkbox"
-                  name="rule"
-                  value="driver_license"
-                  checked
-                />
-                운전면허번호</label
-              >
-            </div>
+
+            <label class="block"
+              ><input type="checkbox" name="rule" value="rrn" checked />
+              주민등록번호</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="fgn" checked />
+              외국인등록번호</label
+            >
+            <label class="block"
+              ><input
+                type="checkbox"
+                name="rule"
+                value="phone_mobile"
+                checked
+              />
+              휴대전화(010)</label
+            >
+            <label class="block"
+              ><input
+                type="checkbox"
+                name="rule"
+                value="phone_city"
+                checked
+              />
+              지역전화(02/031~064)</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="email" checked />
+              이메일</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="card" checked />
+              카드번호</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="passport" checked />
+              여권번호</label
+            >
+            <label class="block"
+              ><input
+                type="checkbox"
+                name="rule"
+                value="driver_license"
+                checked
+              />
+              운전면허번호</label
+            >
+
+            <p class="text-[12px] text-gray-500 mt-2">
+              * 선택 안 하면 서버 PRESET 전체가 사용됩니다.
+            </p>
           </fieldset>
 
-          <div class="space-y-2 mb-3">
-            <div class="flex flex-col gap-2">
-              <button
-                id="btn-scan"
-                class="w-full px-4 py-2 rounded bg-blue-600 text-white"
-              >
-                스캔 실행
-              </button>
-              <button
-                id="btn-save-redacted"
-                class="w-full px-4 py-2 rounded border hidden"
-                disabled
-              >
-                레닥션 결과 다운로드
-              </button>
-            </div>
+          <div class="space-y-2">
+            <button
+              id="btn-scan"
+              class="w-full px-4 py-2 rounded bg-blue-600 text-white"
+            >
+              스캔 실행
+            </button>
+            <button
+              id="btn-save-redacted"
+              class="w-full px-4 py-2 rounded border hidden"
+              disabled
+            >
+              레닥션 파일 저장
+            </button>
             <span id="status" class="block text-sm text-gray-600"></span>
           </div>
         </div>
 
+        <!-- 우측 패널 -->
         <div class="lg:col-span-2 space-y-6">
-          <div
-            id="pdf-preview-block"
-            class="bg-white rounded-2xl shadow p-5 hidden"
-          >
-            <h2 class="font-semibold mb-2">PDF 미리보기</h2>
-            <canvas id="pdf-preview" class="w-full border rounded"></canvas>
+          <!-- 레닥션 미리보기 (칩/그룹 형태) -->
+          <div class="bg-white rounded-2xl shadow p-5">
+            <div class="flex items-center justify-between">
+              <h2 class="font-semibold mb-2">레닥션 미리보기</h2>
+              <div id="file-info" class="text-sm text-gray-600"></div>
+            </div>
+            <div
+              id="redacted-preview"
+              class="mono whitespace-pre-wrap border rounded p-3 text-sm min-h-[12rem]"
+            ></div>
           </div>
 
-          <div
-            id="text-preview-block"
-            class="bg-white rounded-2xl shadow p-5 hidden"
-          >
-            <h2 class="font-semibold mb-2">텍스트 미리보기</h2>
+          <!-- 원본 추출 텍스트 (룰별 값 리스트) -->
+          <div class="bg-white rounded-2xl shadow p-5">
+            <h2 class="font-semibold mb-2">원본 추출 텍스트</h2>
             <textarea
-              id="txt-out"
+              id="txt-raw"
               class="w-full h-48 border rounded p-2 mono"
               readonly
             ></textarea>
           </div>
 
-          <div
-            id="match-result-block"
-            class="bg-white rounded-2xl shadow p-5 hidden"
-          >
-            <h2 class="font-semibold mb-2">매칭 결과</h2>
-            <div id="summary" class="text-sm text-gray-700 mb-2"></div>
-            <div class="overflow-auto">
-              <table class="min-w-full text-sm">
-                <thead>
-                  <tr class="border-b">
-                    <th class="text-left py-2 px-2">Rule</th>
-                    <th class="text-left py-2 px-2">Match</th>
-                    <th class="text-left py-2 px-2">Valid</th>
-                    <th class="text-left py-2 px-2">Context</th>
-                  </tr>
-                </thead>
-                <tbody id="result-rows"></tbody>
-              </table>
+          <!-- 감지된 항목 (OK / FAIL 분리) -->
+          <div class="bg-white rounded-2xl shadow p-5">
+            <div class="flex items-center justify-between">
+              <h2 class="font-semibold mb-2">감지된 항목 (원본)</h2>
+              <div id="summary" class="text-sm text-gray-700"></div>
             </div>
+
+            <h3 class="text-sm font-semibold mb-2 text-emerald-700">
+              유효(OK)
+            </h3>
+            <div id="by-rule-ok" class="space-y-3 mb-6"></div>
+
+            <h3 class="text-sm font-semibold mb-2 text-red-700">
+              무효(FAIL)
+            </h3>
+            <div id="by-rule-ng" class="space-y-3"></div>
           </div>
         </div>
       </div>

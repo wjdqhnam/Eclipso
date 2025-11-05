@@ -9,10 +9,13 @@ from typing import Dict, List, Optional, Literal, Tuple, Set, Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
+
 from server.core.schemas import DetectResponse, PatternItem, Box
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
 from server.core.redaction_rules import PRESET_PATTERNS
-from server.core.matching import find_sensitive_spans
+from server.modules.common import compile_rules  # ★ 추가
+# 더 이상 find_sensitive_spans 는 사용하지 않음
+# from server.core.matching import find_sensitive_spans
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
@@ -51,19 +54,27 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
     except json.JSONDecodeError as e:
         raise HTTPException(
             status_code=400,
-            detail=("잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
-                    f"구체적 오류: {e}")
+            detail=(
+                "잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
+                f"구체적 오류: {e}"
+            ),
         )
 
     if isinstance(obj, dict):
         if "patterns" in obj and isinstance(obj["patterns"], list):
             arr = obj["patterns"]
         else:
-            raise HTTPException(status_code=400, detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요")
+            raise HTTPException(
+                status_code=400,
+                detail="잘못된 patterns_json: 'patterns' 키에 리스트 필요",
+            )
     elif isinstance(obj, list):
         arr = obj
     else:
-        raise HTTPException(status_code=400, detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태")
+        raise HTTPException(
+            status_code=400,
+            detail="잘못된 patterns_json: 리스트 또는 {'patterns': 리스트} 형태",
+        )
 
     try:
         return [PatternItem(**p) for p in arr]
@@ -89,7 +100,9 @@ def _compile_patterns(items: List[PatternItem]) -> List[Any]:
             rp = re.compile(regex)
         except re.error as e:
             name_for_msg = getattr(it, "name", getattr(it, "label", "UNKNOWN"))
-            raise HTTPException(status_code=400, detail=f"정규식 컴파일 실패({name_for_msg}): {e}")
+            raise HTTPException(
+                status_code=400, detail=f"정규식 컴파일 실패({name_for_msg}): {e}"
+            )
 
         # 네임스페이스로 래핑(+ compiled)
         ns = types.SimpleNamespace(**it.dict())
@@ -108,8 +121,10 @@ def _compile_patterns(items: List[PatternItem]) -> List[Any]:
         "- 출력: total_matches, boxes"
     ),
 )
-async def detect(file: UploadFile = File(..., description="PDF 파일"),
-                 patterns_json: Optional[str] = Form(None, description="패턴 목록 JSON(옵션)")):
+async def detect(
+    file: UploadFile = File(..., description="PDF 파일"),
+    patterns_json: Optional[str] = Form(None, description="패턴 목록 JSON(옵션)"),
+):
     _ensure_pdf(file)
     pdf = await file.read()
 
@@ -120,7 +135,7 @@ async def detect(file: UploadFile = File(..., description="PDF 파일"),
         log.debug("patterns_json(len=%d): %r", len(patterns_json), patterns_json[:200])
 
     items = _parse_patterns_json(patterns_json)
-    patterns = _compile_patterns(items)      
+    patterns = _compile_patterns(items)
     boxes = detect_boxes_from_patterns(pdf, patterns)
     return DetectResponse(total_matches=len(boxes), boxes=boxes)
 
@@ -129,10 +144,10 @@ async def detect(file: UploadFile = File(..., description="PDF 파일"),
     "/redactions/apply",
     response_class=Response,
     summary="PDF 레닥션 적용",
-    description="기본 정규식 패턴으로 레닥션 적용."
+    description="기본 정규식 패턴으로 레닥션 적용.",
 )
 async def apply(
-    file: UploadFile = File(..., description="PDF 파일")
+    file: UploadFile = File(..., description="PDF 파일"),
 ):
     _ensure_pdf(file)
     pdf = _read_pdf(file)
@@ -148,38 +163,80 @@ async def apply(
     )
 
 
+# ─────────────────────────────────────────────────────────────
+# 텍스트 매칭 (정규식 + validator)  →  /text/match 가 이 함수 사용
+# ─────────────────────────────────────────────────────────────
 
 def match_text(text: str):
     """
     정규식 기반 민감정보 매칭
+
     - 입력: text
     - 출력: { items, counts }
-    - 항목: rule, value, start, end, context, valid
+
+    items:
+      - rule   : 룰 이름 (rrn, phone_mobile, ...)
+      - value  : 매칭 문자열
+      - start  : 텍스트 내 시작 오프셋
+      - end    : 텍스트 내 끝 오프셋
+      - context: 주변 20자 전후
+      - valid  : validator 기준 유효 여부 (True = OK, False = FAIL)
+
+    counts:
+      - OK(True) 인 것만 rule 별로 카운트 (FAIL 은 카운트에서 제외)
     """
     try:
         if not isinstance(text, str):
             text = str(text)
 
-        results = find_sensitive_spans(text)
+        # modules.common.compile_rules() 는 이미
+        # PRESET_PATTERNS + RULES 기반으로
+        # (name, compiled_regex, need_valid, priority, validator) 튜플을 만들어줌.
+        comp = compile_rules()
+
+        matches: List[Dict[str, Any]] = {}
         matches = []
         counts: Dict[str, int] = {}
 
-        for start, end, value, rule_name in results:
-            ctx_start = max(0, start - 20)
-            ctx_end = min(len(text), end + 20)
-            matches.append({
-                "rule": rule_name,
-                "value": value,
-                "start": start,
-                "end": end,
-                "context": text[ctx_start:ctx_end],
-                "valid": True,
-            })
-            counts[rule_name] = counts.get(rule_name, 0) + 1
+        for name, rx, need_valid, prio, validator in comp:
+            if rx is None:
+                continue
+
+            for m in rx.finditer(text):
+                s, e = m.span()
+                val = m.group(0)
+
+                ok = True
+                if need_valid and validator:
+                    try:
+                        try:
+                            ok = bool(validator(val))
+                        except TypeError:
+                            ok = bool(validator(val, None))
+                    except Exception:
+                        ok = False  # 검증 중 예외는 FAIL 취급
+
+                ctx_start = max(0, s - 20)
+                ctx_end = min(len(text), e + 20)
+
+                matches.append(
+                    {
+                        "rule": name,
+                        "value": val,
+                        "start": s,
+                        "end": e,
+                        "context": text[ctx_start:ctx_end],
+                        "valid": ok,
+                    }
+                )
+
+                # counts 는 OK 만 집계
+                if ok:
+                    counts[name] = counts.get(name, 0) + 1
 
         log.debug("regex match count=%d", len(matches))
         return {"items": matches, "counts": counts}
 
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         log.exception("match_text 내부 오류")
         raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")

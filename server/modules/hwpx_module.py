@@ -68,7 +68,7 @@ def hwpx_text(zipf: zipfile.ZipFile) -> str:
 
     names = zipf.namelist()
 
-    # 1) 본문 Contents/* 의 텍스트 (대소문자 무시용으로 low 같이 봄)
+    # 1) 본문 Contents/* 의 텍스트
     for name in sorted(names):
         low = name.lower()
         if not (low.startswith("contents/") and low.endswith(".xml")):
@@ -121,32 +121,50 @@ def hwpx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(x for x in out if x))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# /text/extract 용 텍스트 추출 (사람이 보기 좋게 정리)
+# ─────────────────────────────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
     """
     /text/extract 엔드포인트가 기대하는 형식으로 HWPX 텍스트를 반환.
     - full_text: 전체 텍스트
     - pages    : 페이지 배열 (HWPX는 페이지 개념이 없어 1페이지로 통합)
-    텍스트 미리보기에서 쓰레기값(XML 태그, 각주 마커 등)을 최대한 제거한다.
+    텍스트 미리보기에서 쓰레기값(XML 태그, 각주 마커, 시트 주소 등)을 최대한 제거한다.
     """
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         raw = hwpx_text(zipf)
 
-    # --- 1) 차트/내장 XLSX 에서 섞여 들어온 XML 태그 제거 ---
-    # 예: "<c:v>계열 1" -> "계열 1"
-    cleaned = re.sub(r"<[^>\n]+>", "", raw)
+    # 1) 차트/내장 XLSX 에서 섞여 들어온 XML 태그 제거
+    #    예: "<c:v>계열 1" -> "계열 1"
+    txt = re.sub(r"<[^>\n]+>", "", raw)
 
-    # --- 2) HWP 각주/주석 마커 같은 쓰레기 줄 제거 ---
-    # "^1.", "^2)", "(^3)" 등
+    # 2) HWP 각주/주석 마커 줄 제거: "^1.", "^2)", "(^3)" 등
     lines: List[str] = []
-    for line in cleaned.splitlines():
+    for line in txt.splitlines():
         s = line.strip()
-        if re.match(r"^\^\d+[\).\s]*$", s):
+        # 전체 라인이 각주 마커만 있으면 버림
+        if re.fullmatch(r"\(?\^\d+[\).\s]*", s):
             continue
         lines.append(line)
-    cleaned = "\n".join(lines)
+    txt = "\n".join(lines)
 
-    # --- 3) 공통 정리 ---
-    cleaned = cleanup_text(cleaned)
+    # 라인 중간에 남은 "(^5)" 같은 패턴도 제거
+    txt = re.sub(r"\(\^\d+\)", "", txt)
+
+    # 3) 엑셀 시트/범위 토큰 제거
+    #    예: "Sheet1!$B$1", "Sheet1!$B$2:$B$5"
+    txt = re.sub(
+        r"Sheet\d*!\$[A-Z]+\$\d+(?::\$[A-Z]+\$\d+)?",
+        "",
+        txt,
+        flags=re.IGNORECASE,
+    )
+
+    # 4) "General4.3" 같은 포맷 문자열에서 General 제거 → "4.3"
+    txt = re.sub(r"General(?=\s*\d)", "", txt, flags=re.IGNORECASE)
+
+    # 5) 공백/줄바꿈 정리
+    cleaned = cleanup_text(txt)
 
     return {
         "full_text": cleaned,
@@ -219,7 +237,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
                     value=val,
                     valid=ok,
                     context=text[max(0, m.start() - 20): min(len(text), m.end() + 20)],
-                    location=XmlLocation(kind="hwpx", part="*merged_text*", start=m.start(), end=m.end()),
+                    location=XmlLocation(
+                        kind="hwpx",
+                        part="*merged_text*",
+                        start=m.start(),
+                        end=m.end(),
+                    ),
                 )
             )
 
@@ -243,7 +266,7 @@ def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
         if HWPX_STRIP_PREVIEW:
             return b""
         if HWPX_BLANK_PREVIEW and low.endswith((".png", ".jpg", ".jpeg")):
-            # 1x1 투명 PNG (고정 바이트)
+            # 1x1 PNG (고정 바이트)
             return (
                 b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
                 b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0cIDATx\x9cc\x00\x01"
