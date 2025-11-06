@@ -103,10 +103,25 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(all_txt))
 
 
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+def extract_text(file_bytes: bytes) -> dict:
+    """
+    PPTX 바이트에서 텍스트만 추출.
+    full_text / pages 형식으로 반환.
+    """
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+        txt = pptx_text(zipf)
+
+    return {
+        "full_text": txt,
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보 추출
-#   - compile_rules()가 3/4/5튜플 또는 네임드 객체여도 동작하게 처리
-#   - validator가 있으면 valid 플래그도 채워 줌
 # ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = pptx_text(zipf)
@@ -167,10 +182,6 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 파일 단위 레닥션
-#   - ppt/slides/*.xml        : 슬라이드 텍스트 노드 마스킹
-#   - ppt/charts/*.xml        : 차트 라벨/값 마스킹
-#   - ppt/charts/_rels/*.rels : 차트 관계 정리(외부데이터 링크 정리용, 현재는 스텁)
-#   - ppt/embeddings/*.xlsx   : 임베디드 엑셀 내부까지 레닥션
 # ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
@@ -182,16 +193,14 @@ def redact_item(filename: str, data: bytes, comp):
     # 2) 차트 XML: 라벨/값 + 텍스트 노드 마스킹
     if low.startswith("ppt/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
-        # chart_sanitize 안에서 이미 sub_text_nodes를 쓰지만,
-        # 안전하게 한 번 더 텍스트 노드 기준으로 돌려준다.
         return sub_text_nodes(b2, comp)[0]
 
-    # 3) 차트 RELS: externalData / 임베딩 / 외부 링크 정리 (복구 팝업 방지)
+    # 3) 차트 RELS
     if low.startswith("ppt/charts/_rels/") and low.endswith(".rels"):
         b3, _ = chart_rels_sanitize(data)
         return b3
 
-    # 4) 임베디드 XLSX: 내부까지 레닥션(셀/차트 텍스트 모두 마스킹)
+    # 4) 임베디드 XLSX
     if low.startswith("ppt/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)
 
