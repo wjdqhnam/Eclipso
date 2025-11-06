@@ -67,13 +67,11 @@ def apply_text_redaction(pdf_bytes: bytes, extra_spans: list = None) -> bytes:
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        # 기존 박스 우선 반영(주석만 추가)
         for b in boxes:
             page = doc.load_page(int(b.page))
             rect = fitz.Rect(float(b.x0), float(b.y0), float(b.x1), float(b.y1))
             page.add_redact_annot(rect, fill=(0, 0, 0))
 
-        # 추가 스팬 반영
         for page in doc:
             for s in extra_spans:
                 frag = (s.get("text_sample") or "").strip()
@@ -81,20 +79,31 @@ def apply_text_redaction(pdf_bytes: bytes, extra_spans: list = None) -> bytes:
                     continue
                 rects = page.search_for(frag)
                 for r in rects:
-                    if s.get("decision") == "highlight":
-                        annot = page.add_highlight_annot(r)
-                        annot.set_colors(stroke=(1, 1, 0))
-                        annot.set_opacity(0.45)
-                        annot.update()
-                    else:
-                        page.add_redact_annot(r, fill=(0, 0, 0))
+                    page.add_redact_annot(r, fill=(0, 0, 0))
 
-        # 페이지 단위 적용
         for page in doc:
             page.apply_redactions()
 
         out = io.BytesIO()
         doc.save(out)
         return out.getvalue()
+    finally:
+        doc.close()
+
+
+def extract_text(pdf_bytes: bytes) -> str:
+    if not pdf_bytes:
+        return ""
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if doc.needs_pass:
+            raise RuntimeError("암호화된 PDF입니다")
+
+        texts = []
+        for page in doc:
+            t = page.get_text("text") or ""
+            texts.append(t)
+        return "\n".join(texts)
     finally:
         doc.close()
