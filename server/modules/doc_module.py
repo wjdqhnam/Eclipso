@@ -12,12 +12,10 @@ from server.core.matching import find_sensitive_spans
 
 # ========== CONFIG ==========
 DEBUG = True
-# ============================
 
 
-# ─────────────────────────────
+
 # 유틸: 리틀엔디언 헬퍼
-# ─────────────────────────────
 def le16(b: bytes, off: int) -> int:
     return struct.unpack_from("<H", b, off)[0]
 
@@ -25,9 +23,8 @@ def le32(b: bytes, off: int) -> int:
     return struct.unpack_from("<I", b, off)[0]
 
 
-# ─────────────────────────────
+
 # Word 구조 읽기
-# ─────────────────────────────
 def _get_table_stream_name(word_data: bytes, ole: olefile.OleFileIO) -> Optional[str]:
     fib_flags = le16(word_data, 0x000A)
     fWhichTblStm = (fib_flags & 0x0200) != 0
@@ -49,9 +46,8 @@ def _read_word_and_table_streams(file_bytes: bytes) -> Tuple[Optional[bytes], Op
         return None, None
 
 
-# ─────────────────────────────
+
 # PlcPcd / CLX 파싱
-# ─────────────────────────────
 def _get_clx_data(word_data: bytes, table_data: bytes) -> Optional[bytes]:
     fcClx, lcbClx = le32(word_data, 0x01A2), le32(word_data, 0x01A6)
     if not table_data or fcClx + lcbClx > len(table_data):
@@ -113,9 +109,7 @@ def _decode_piece(chunk: bytes, fCompressed: bool) -> str:
         return ""
 
 
-# ─────────────────────────────
 # 텍스트 추출
-# ─────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
     """WordDocument에서 전체 텍스트 추출"""
     try:
@@ -142,9 +136,7 @@ def extract_text(file_bytes: bytes) -> dict:
         return {"full_text": "", "raw_text": "", "pages": [{"page": 1, "text": ""}]}
 
 
-# ─────────────────────────────
 # 탐지 span 보정(분리)
-# ─────────────────────────────
 def _split_cross_paragraph_matches(matches, text):
     """\r\r 또는 \n\n 문단 경계를 포함한 매치를 자동으로 분리"""
     new_matches = []
@@ -166,9 +158,7 @@ def _split_cross_paragraph_matches(matches, text):
     return new_matches
 
 
-# ─────────────────────────────
 # 바이트 치환 (레닥션)
-# ─────────────────────────────
 def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replacement_char: str = "*") -> bytes:
     """CP 좌표 기반으로 WordDocument 스트림 내 바이트 치환"""
     try:
@@ -245,9 +235,7 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
         return file_bytes
 
 
-# ─────────────────────────────
 # OLE 파일 갱신
-# ─────────────────────────────
 def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
     """기존 OLE 문서의 WordDocument 스트림만 교체"""
     try:
@@ -272,10 +260,8 @@ def _create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> by
         print(f"[ERR] OLE 교체 중 오류: {e}")
         return original_file_bytes
 
-
-# ─────────────────────────────
+        
 # 전체 레닥션 프로세스
-# ─────────────────────────────
 def redact(file_bytes: bytes) -> bytes:
     """DOC 파일 전체 레닥션"""
     try:

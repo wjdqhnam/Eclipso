@@ -1,4 +1,3 @@
-# server/api/text_api.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
@@ -10,18 +9,11 @@ from server.core.redaction_rules import PRESET_PATTERNS
 from server.api.redaction_api import match_text
 from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 from server.modules import pdf_module
-from server.utils.file_reader import extract_from_file  # 프로젝트 공용 추출 유틸(있으면 활용)
-
+from server.utils.file_reader import extract_from_file 
 router = APIRouter(prefix="/text", tags=["text"])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# helpers
-# ──────────────────────────────────────────────────────────────────────────────
 def _ensure_full_text_payload(raw: Any) -> Dict[str, str]:
-    """
-    다양한 리턴 형태를 항상 {"full_text": "..."}로 정규화.
-    """
     if raw is None:
         return {"full_text": ""}
     if isinstance(raw, dict):
@@ -32,11 +24,10 @@ def _ensure_full_text_payload(raw: Any) -> Dict[str, str]:
             return {"full_text": raw.decode("utf-8", "ignore")}
         except Exception:
             return {"full_text": ""}
-    # string 등
     return {"full_text": str(raw or "")}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 @router.post(
     "/extract",
     summary="파일에서 텍스트 추출",
@@ -49,25 +40,18 @@ async def extract_text(file: UploadFile = File(...)):
         if not data:
             raise HTTPException(status_code=400, detail="빈 파일입니다.")
 
-        # PDF는 바로 pdf_module 사용 (PyMuPDF)
+
         if ext == ".pdf":
-            text = pdf_module.extract_text(data)  # 우리가 추가한 함수
+            text = pdf_module.extract_text(data)  
             return {"full_text": text or ""}
 
-        # 그 외 포맷은 기존 공용 유틸을 신뢰하되, 키를 정규화
-        # extract_from_file는 업로드 파일 객체를 그대로 받도록 만들어져 있음(프로젝트 기준)
         try:
-            # 일부 구현은 UploadFile을 받고 dict/str을 리턴
             res = await extract_from_file(file)
         except TypeError:
-            # 구현에 따라 bytes 경로만 받을 수도 있어 임시파일 경유
             with tempfile.TemporaryDirectory() as td:
                 src = os.path.join(td, f"src{ext or ''}")
                 with open(src, "wb") as f:
                     f.write(data)
-                # 경로 기반 버전일 경우:
-                #   res = extract_from_file(src)
-                # UploadFile 기반이라면 위 await 버전으로 유지
                 res = {"full_text": ""}
 
         return _ensure_full_text_payload(res)
@@ -78,7 +62,6 @@ async def extract_text(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"서버 내부 오류: {e}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 @router.get(
     "/rules",
     summary="정규식 규칙 이름 목록",
@@ -88,7 +71,6 @@ async def list_rules():
     return [r["name"] for r in PRESET_PATTERNS]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 @router.post(
     "/match",
     summary="정규식 매칭 실행",
@@ -96,11 +78,10 @@ async def list_rules():
 )
 async def match(req: Dict[str, Any] = Body(...)):
     text = (req or {}).get("text", "") or ""
-    # 옵션으로 선택 규칙 전달 시 서버 쪽 필터링을 원하면 여기에 적용하면 됨.
     return match_text(text)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 @router.get(
     "/policy",
     summary="기본 병합 정책 조회",
@@ -119,7 +100,6 @@ async def set_policy(policy: Dict[str, Any] = Body(...)):
     return {"ok": True, "policy": policy}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 @router.post(
     "/detect",
     summary="정규식+NER 통합 탐지",
@@ -184,7 +164,6 @@ async def detect(req: Dict[str, Any] = Body(...)):
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 @router.post("/ner")
 async def ner_detect(
     request: Request,

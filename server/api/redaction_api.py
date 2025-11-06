@@ -13,9 +13,8 @@ from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 from server.core.schemas import DetectResponse, PatternItem, Box
 from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
 from server.core.redaction_rules import PRESET_PATTERNS
-from server.modules.common import compile_rules  # ★ 추가
-# 더 이상 find_sensitive_spans 는 사용하지 않음
-# from server.core.matching import find_sensitive_spans
+from server.modules.common import compile_rules  
+
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
@@ -36,12 +35,7 @@ def _read_pdf(file: UploadFile) -> bytes:
 
 
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    """
-    입력 허용
-    - None / "" / 공백 / "null" / "None" -> PRESET_PATTERNS
-    - 배열: [ { ... } ]
-    - 객체: { "patterns": [ { ... } ] }
-    """
+
     if patterns_json is None:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
@@ -83,11 +77,6 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
 
 
 def _compile_patterns(items: List[PatternItem]) -> List[Any]:
-    """
-    PatternItem -> 어댑터 객체(SimpleNamespace)
-    - compiled: re.Pattern
-    - 기존 필드: 그대로 속성화
-    """
     compiled: List[Any] = []
     for it in items:
         # PatternItem 속성 추출
@@ -104,7 +93,6 @@ def _compile_patterns(items: List[PatternItem]) -> List[Any]:
                 status_code=400, detail=f"정규식 컴파일 실패({name_for_msg}): {e}"
             )
 
-        # 네임스페이스로 래핑(+ compiled)
         ns = types.SimpleNamespace(**it.dict())
         setattr(ns, "compiled", rp)
         compiled.append(ns)
@@ -162,36 +150,11 @@ async def apply(
         headers={"Content-Disposition": 'attachment; filename="redacted.pdf"'},
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# 텍스트 매칭 (정규식 + validator)  →  /text/match 가 이 함수 사용
-# ─────────────────────────────────────────────────────────────
-
+# 텍스트 매칭 (정규식 + validator) 
 def match_text(text: str):
-    """
-    정규식 기반 민감정보 매칭
-
-    - 입력: text
-    - 출력: { items, counts }
-
-    items:
-      - rule   : 룰 이름 (rrn, phone_mobile, ...)
-      - value  : 매칭 문자열
-      - start  : 텍스트 내 시작 오프셋
-      - end    : 텍스트 내 끝 오프셋
-      - context: 주변 20자 전후
-      - valid  : validator 기준 유효 여부 (True = OK, False = FAIL)
-
-    counts:
-      - OK(True) 인 것만 rule 별로 카운트 (FAIL 은 카운트에서 제외)
-    """
     try:
         if not isinstance(text, str):
             text = str(text)
-
-        # modules.common.compile_rules() 는 이미
-        # PRESET_PATTERNS + RULES 기반으로
-        # (name, compiled_regex, need_valid, priority, validator) 튜플을 만들어줌.
         comp = compile_rules()
 
         matches: List[Dict[str, Any]] = {}
