@@ -1,33 +1,35 @@
-// app.js — 업로드 + 스캔 + 정규식/NER 렌더 + PDF 미리보기
-
-// 작은 유틸
-const $ = (s) => document.querySelector(s)
-const $$ = (s) => Array.from(document.querySelectorAll(s))
 const API_BASE = () => window.API_BASE || 'http://127.0.0.1:8000'
+const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
 
+const $ = (sel) => document.querySelector(sel)
+const $$ = (sel) => Array.from(document.querySelectorAll(sel))
+
+// 마지막 생성 산출물(파일 저장용)
 let __lastRedactedBlob = null
-let __lastRedactedName = 'redacted.pdf'
+let __lastRedactedName = 'redacted.bin'
 
+// HTML 이스케이프
 const esc = (s) =>
   (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
+// 배지 숫자 업데이트
 const badge = (sel, n) => {
   const el = $(sel)
   if (el) el.textContent = String(n ?? 0)
 }
 
+// 아코디언 열고 닫기
 const setOpen = (name, open) => {
-  const cont = document.getElementById(
-    name === 'pdf' ? 'pdf-preview-block' : `${name}-result-block`
-  )
-  const body = document.getElementById(`${name}-body`)
+  const cont =
+    name === 'pdf' ? $('#pdf-preview-block') : $(`#${name}-result-block`)
+  const body = $(`#${name}-body`)
   const chev = document.querySelector(`[data-chevron="${name}"]`)
   cont && cont.classList.remove('hidden')
   body && body.classList.toggle('hidden', !open)
   chev && chev.classList.toggle('rotate-180', !open)
 }
 
-// 아코디언 토글
+// 전역 클릭으로 아코디언 토글
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-toggle]')
   if (!btn) return
@@ -36,7 +38,7 @@ document.addEventListener('click', (e) => {
   setOpen(name, body ? body.classList.contains('hidden') : true)
 })
 
-// 규칙 로드
+// ===== 규칙(정규식) 목록 로드 =====
 async function loadRules() {
   try {
     const r = await fetch(`${API_BASE()}/text/rules`)
@@ -58,7 +60,12 @@ async function loadRules() {
   }
 }
 
-// 드롭존
+// 현재 체크된 규칙 이름 배열
+function selectedRuleNames() {
+  return $$('input[name="rule"]:checked').map((el) => el.value)
+}
+
+// ===== 드롭존 =====
 function setupDropZone() {
   const dz = $('#dropzone'),
     input = $('#file'),
@@ -79,6 +86,7 @@ function setupDropZone() {
   ;['dragover', 'drop'].forEach((ev) =>
     window.addEventListener(ev, (e) => e.preventDefault())
   )
+
   dz.addEventListener('dragenter', (e) => {
     e.preventDefault()
     depth++
@@ -130,7 +138,7 @@ function setupDropZone() {
   input.addEventListener('change', (e) => showName(e.target.files?.[0] || null))
 }
 
-// PDF 미리보기 (레닥션 결과만)
+// ===== PDF 미리보기 (레닥션 결과 첫 페이지만) =====
 async function renderRedactedPdfPreview(blob) {
   const cv = $('#pdf-preview')
   if (!cv) return
@@ -138,21 +146,21 @@ async function renderRedactedPdfPreview(blob) {
   if (!blob) return g.clearRect(0, 0, cv.width, cv.height)
   const pdf = await pdfjsLib.getDocument({ data: await blob.arrayBuffer() })
     .promise
-  const page = await pdf.getPage(1),
-    vp = page.getViewport({ scale: 1.2 })
+  const page = await pdf.getPage(1)
+  const vp = page.getViewport({ scale: 1.2 })
   cv.width = vp.width
   cv.height = vp.height
   await page.render({ canvasContext: g, viewport: vp }).promise
 }
 
-// 정규식 결과 렌더
+// ===== 정규식 결과 렌더 =====
 const take = (s, n) => (s.length <= n ? s : s.slice(0, n) + '…')
 
 function highlightFrag(ctx, val, pad = 60) {
   const i = (ctx || '').indexOf(val || '')
   if (i < 0) return esc(take(ctx || '', 140))
-  const start = Math.max(0, i - pad),
-    end = Math.min((ctx || '').length, i + (val || '').length + pad)
+  const start = Math.max(0, i - pad)
+  const end = Math.min((ctx || '').length, i + (val || '').length + pad)
   const pre = esc((ctx || '').slice(start, i))
   const mid = esc(val || '')
   const post = esc((ctx || '').slice(i + (val || '').length, end))
@@ -184,8 +192,8 @@ function renderRegexResults(res) {
   for (const [rule, arr] of Object.entries(groups).sort(
     (a, b) => b[1].length - a[1].length
   )) {
-    const ok = arr.filter((x) => x.valid).length,
-      fail = arr.length - ok
+    const ok = arr.filter((x) => x.valid).length
+    const fail = arr.length - ok
 
     const container = document.createElement('div')
     container.className = 'rounded-xl border border-gray-200 mb-3'
@@ -252,10 +260,10 @@ function renderRegexResults(res) {
   })
 }
 
-// NER 렌더
+// ===== NER 테이블 렌더 =====
 function renderNerTable(ner) {
-  const rows = $('#ner-rows'),
-    sum = $('#ner-summary')
+  const rows = $('#ner-rows')
+  const sum = $('#ner-summary')
   const allow = new Set()
   $('#ner-show-ps')?.checked !== false && allow.add('PS')
   $('#ner-show-lc')?.checked !== false && allow.add('LC')
@@ -291,23 +299,33 @@ function renderNerTable(ner) {
   }
 }
 
-// 메인 플로우
+// ===== 상태 표시 =====
+function setStatus(msg) {
+  const el = $('#status')
+  if (el) el.textContent = msg || ''
+}
+
+// ===== 스캔 버튼 핸들러 =====
 $('#btn-scan')?.addEventListener('click', async () => {
   const f = $('#file')?.files?.[0]
-  if (!f) return alert('파일을 선택하세요')
+  if (!f) return alert('파일을 선택하세요.')
+
+  // 출력 파일명 기본값 구성
   const ext = (f.name.split('.').pop() || '').toLowerCase()
   __lastRedactedName = f.name
     ? f.name.replace(/\.[^.]+$/, `_redacted.${ext}`)
     : `redacted.${ext}`
 
-  const st = $('#status')
-  if (st) st.textContent = '텍스트 추출 및 매칭 중...'
+  setStatus('텍스트 추출 및 매칭 중...')
   const fd = new FormData()
   fd.append('file', f)
+
+  // 결과 패널 보이기
   $('#match-result-block')?.classList.remove('hidden')
   $('#ner-result-block')?.classList.remove('hidden')
 
   try {
+    // 1) 텍스트 추출
     const r1 = await fetch(`${API_BASE()}/text/extract`, {
       method: 'POST',
       body: fd,
@@ -315,11 +333,14 @@ $('#btn-scan')?.addEventListener('click', async () => {
     if (!r1.ok)
       throw new Error(`텍스트 추출 실패 (${r1.status})\n${await r1.text()}`)
     const { full_text: text = '' } = await r1.json()
+
+    // 본문 프리뷰
     $('#text-preview-block')?.classList.remove('hidden')
     const ta = $('#txt-out')
     if (ta) ta.value = text || '(본문 텍스트가 비어 있습니다.)'
 
-    const rules = $$('input[name="rule"]:checked').map((x) => x.value)
+    // 2) 정규식 매칭
+    const rules = selectedRuleNames()
     const r2 = await fetch(`${API_BASE()}/text/match`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -329,6 +350,7 @@ $('#btn-scan')?.addEventListener('click', async () => {
     renderRegexResults(await r2.json())
     setOpen('match', true)
 
+    // 3) NER
     const r3 = await fetch(`${API_BASE()}/text/ner`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -340,9 +362,11 @@ $('#btn-scan')?.addEventListener('click', async () => {
       $(sel)?.addEventListener('change', () => renderNerTable(ner))
     )
     setOpen('ner', true)
-    if (st) st.textContent = `스캔 완료 (${ext.toUpperCase()} 처리)`
 
-    if (st) st.textContent = '레닥션 파일 생성 중...'
+    setStatus(`스캔 완료 (${ext.toUpperCase()} 처리)`)
+
+    // 4) 레닥션 파일 생성
+    setStatus('레닥션 파일 생성 중...')
     const r4 = await fetch(`${API_BASE()}/redact/file`, {
       method: 'POST',
       body: fd,
@@ -352,6 +376,7 @@ $('#btn-scan')?.addEventListener('click', async () => {
     const ctype = r4.headers.get('Content-Type') || 'application/octet-stream'
     __lastRedactedBlob = new Blob([blob], { type: ctype })
 
+    // PDF면 미리보기
     if (ctype.includes('pdf')) {
       setOpen('pdf', true)
       await renderRedactedPdfPreview(__lastRedactedBlob)
@@ -359,19 +384,21 @@ $('#btn-scan')?.addEventListener('click', async () => {
       setOpen('pdf', false)
     }
 
+    // 저장 버튼 노출
     const btn = $('#btn-save-redacted')
     if (btn) {
       btn.classList.remove('hidden')
       btn.disabled = false
     }
-    if (st) st.textContent = '레닥션 완료 — 다운로드 가능'
+
+    setStatus('레닥션 완료 — 다운로드 가능')
   } catch (e) {
     console.error(e)
-    if (st) st.textContent = `오류: ${e.message}`
+    setStatus(`오류: ${e.message || e}`)
   }
 })
 
-// 다운로드
+// ===== 다운로드 버튼 =====
 $('#btn-save-redacted')?.addEventListener('click', () => {
   if (!__lastRedactedBlob) return alert('레닥션된 파일이 없습니다.')
   const url = URL.createObjectURL(__lastRedactedBlob)
@@ -382,7 +409,7 @@ $('#btn-save-redacted')?.addEventListener('click', () => {
   URL.revokeObjectURL(url)
 })
 
-// 초기화
+// ===== 초기화 =====
 document.addEventListener('DOMContentLoaded', () => {
   loadRules()
   setupDropZone()

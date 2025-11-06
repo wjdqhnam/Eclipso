@@ -5,18 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
 
-    <!-- 라이브러리 로더 -->
+    <!-- Tailwind & PDF.js -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
     <script>
-      // API_BASE 자동 설정
+      // API_BASE 자동 설정 (로컬/배포 공용)
       const origin = window.location.origin
       window.API_BASE =
         origin.includes('127.0.0.1') || origin.includes('localhost')
           ? 'http://127.0.0.1:8000'
           : origin.replace(/\/$/, '')
-      // pdf.js 워커 경로
+
+      // HWPX 뷰어 URL 사용 시 여기에 지정(선택)
+      window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
+
+      // pdf.js 워커 경로 설정
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
@@ -70,6 +74,7 @@
             <fieldset class="rounded-xl border border-gray-200 p-4">
               <legend class="px-1 text-sm font-medium">규칙 선택</legend>
               <div id="rules-container" class="mt-2 space-y-2 text-sm">
+                <!-- 서버에서 /text/rules 로드. 실패 시 기본 샘플 -->
                 <label class="flex items-center gap-2">
                   <input type="checkbox" name="rule" value="rrn" checked />
                   <span>주민등록번호</span>
@@ -228,7 +233,6 @@
                   style="min-width: 220px"
                 />
               </div>
-              <div id="match-chips" class="flex flex-wrap gap-2 mb-4"></div>
               <div id="match-groups" class="space-y-3"></div>
             </div>
           </div>
