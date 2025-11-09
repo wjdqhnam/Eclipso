@@ -1,3 +1,5 @@
+# server/modules/docx_module.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import io
@@ -5,7 +7,7 @@ import re
 import zipfile
 from typing import List, Tuple
 
-# common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback 
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
 try:
     from .common import (
         cleanup_text,
@@ -29,7 +31,7 @@ except Exception:  # pragma: no cover - 구조가 달라졌을 때 대비
         sanitize_docx_content_types,
     )
 
-# schemas 임포트: core 우선, 실패 시 대안 경로 시도 
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
 try:
     from ..core.schemas import XmlMatch, XmlLocation  # 현재 리포 구조
 except Exception:
@@ -39,6 +41,12 @@ except Exception:
         from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCX 텍스트 추출
+#   - word/document.xml 본문 텍스트
+#   - word/charts/*.xml 라벨/값
+#   - word/embeddings/*.xlsx 안의 셀/차트 텍스트
+# ─────────────────────────────────────────────────────────────────────────────
 def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
     parts: List[str] = []
 
@@ -90,8 +98,12 @@ def docx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(x for x in [text_main, text_charts] if x))
 
 
-# /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
 def extract_text(file_bytes: bytes) -> dict:
+    """
+    DOCX 바이트에서 텍스트만 추출.
+    full_text / pages 형식으로 반환 (HWPX extract_text와 동일 형식).
+    """
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         txt = docx_text(zipf)
 
@@ -103,6 +115,10 @@ def extract_text(file_bytes: bytes) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보 추출
+#   - compile_rules()가 3/4/5튜플 또는 네임드 객체여도 동작하게 유연하게 처리
+# ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = docx_text(zipf)
     comp = compile_rules()
@@ -145,8 +161,9 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "docx", text
 
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # 파일 단위 레닥션: 각 파트별로 처리
+# ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
 

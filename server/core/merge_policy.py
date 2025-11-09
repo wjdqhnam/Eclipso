@@ -3,12 +3,13 @@ from typing import List, Dict, Any, Tuple
 import re
 
 
+# 기본 정책 + 색상 매핑
 DEFAULT_POLICY: Dict[str, Any] = {
     "allowed_labels": ["PS", "OG", "LC", "DT"],
     "thresholds": {"PS": 0.50, "OG": 0.55, "LC": 0.55, "DT": 0.60},
-    "regex_priority": True,
-    "qt_policy": "off",
-    "dt_policy": "sensitive_only",
+    "regex_priority": True,                 
+    "qt_policy": "off",                   
+    "dt_policy": "sensitive_only",         
     "dt_sensitive_triggers": [
         "생년월일", "출생", "DOB",
         "발급", "만료", "유효기간",
@@ -19,6 +20,15 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "context_window": 18,
     "emit_text_sample": True,
     "text_sample_maxlen": 40,
+
+    "use_ner_highlight": True,
+    "color_map": {
+        "PS": "#ff4d4f",   
+        "LC": "#ffb6c1",  
+        "OG": "#ffd666",   
+        "DT": "#87cefa",   
+        "QT": "#90ee90"    
+    }
 }
 
 NER_PRIORITY = {"PS": 5, "OG": 4, "LC": 3, "DT": 2, "QT": 1}
@@ -79,6 +89,8 @@ class MergePolicy:
         dt_policy = str(p.get("dt_policy", "sensitive_only"))
         dt_triggers = list(p.get("dt_sensitive_triggers", []))
         ctx = int(p.get("context_window", 18))
+        use_hl = bool(p.get("use_ner_highlight", True))
+        color_map = p.get("color_map", {})
         emit_sample = bool(p.get("emit_text_sample", True))
         sample_len = int(p.get("text_sample_maxlen", 40))
 
@@ -108,6 +120,7 @@ class MergePolicy:
                 "source": "regex",
                 "score": None,
                 "decision": "redact",
+                "color": None,
                 "reason": "R1_regex_lock"
             }
             if emit_sample:
@@ -154,13 +167,33 @@ class MergePolicy:
                 "label": lab,
                 "source": "ner",
                 "score": s.get("score"),
-                "decision": "redact" if _is_sensitive_number(frag) else "accept",
-                "reason": "R2_ner_accept"
             }
+
+            # QT 특례: 민감 숫자면 레닥션
+            if lab == "QT":
+                if _is_sensitive_number(frag):
+                    item.update({"decision": "redact", "color": None, "reason": "R3_qt_sensitive"})
+                else:
+                    if use_hl:
+                        item.update({"decision": "highlight", "color": color_map.get("QT"), "reason": "R2_ner_accept"})
+                    else:
+                        # highlight off면 그냥 버림
+                        report["dropped_by_label_block"] += 1
+                        continue
+            else:
+                # 일반 라벨은 하이라이트
+                if use_hl:
+                    item.update({"decision": "highlight", "color": color_map.get(lab), "reason": "R2_ner_accept"})
+                else:
+                    # 하이라이트 비활성화면 버림
+                    report["dropped_by_label_block"] += 1
+                    continue
+
             if emit_sample:
                 item["text_sample"] = _text_sample(text, s0, e0, sample_len)
             out.append(item)
 
+        # 5) 정렬 + 라벨 카운트
         out.sort(key=lambda x: (x["start"], x["end"], x["source"]))
         counts: Dict[str,int] = {}
         for s in out:

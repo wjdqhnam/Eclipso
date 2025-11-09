@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io
 import os
@@ -9,19 +10,19 @@ import tempfile
 import subprocess
 from typing import List, Optional
 
-import fitz 
+import fitz  # PyMuPDF
 from fastapi import HTTPException
 
-# XmlScanResponse 임포트
+# ── XmlScanResponse 임포트: core 우선, 실패 시 대안 경로 ────────────────────────
 try:
-    from ..core.schemas import XmlScanResponse  #
+    from ..core.schemas import XmlScanResponse  # 일반적인 현재 리포 구조 (server/xml_redaction.py 기준)
 except Exception:
     try:
-        from ..schemas import XmlScanResponse   
+        from ..schemas import XmlScanResponse   # 일부 브랜치/옛 구조
     except Exception:
-        from server.core.schemas import XmlScanResponse
+        from server.core.schemas import XmlScanResponse  # 절대경로 fallback
 
-# 같은 패키지(server.modules) 내부 모듈 임포트
+# ── 같은 패키지(server.modules) 내부 모듈 임포트 ────────────────────────────────
 try:
     from . import docx_module as docx
 except Exception:  # pragma: no cover
@@ -50,7 +51,9 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger("xml_redaction")
 
+# --------------------------
 # 타입 판별
+# --------------------------
 def detect_xml_type(filename: str) -> str:
     l = (filename or "").lower()
     if l.endswith(".docx"): return "docx"
@@ -59,7 +62,9 @@ def detect_xml_type(filename: str) -> str:
     if l.endswith(".hwpx"): return "hwpx"
     raise HTTPException(400, f"Unsupported XML type for: {filename}")
 
+# --------------------------
 # 스캔
+# --------------------------
 def xml_scan(file_bytes: bytes, filename: str) -> XmlScanResponse:
     text_limit = int(os.getenv("XML_SCAN_TEXT_LIMIT", "20000"))
     with io.BytesIO(file_bytes) as bio, zipfile.ZipFile(bio, "r") as zipf:
@@ -84,7 +89,9 @@ def xml_scan(file_bytes: bytes, filename: str) -> XmlScanResponse:
             extracted_text=text or "",
         )
 
+# --------------------------
 # HWPX: 시크릿 수집(사전 스캔)
+# --------------------------
 def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:
     text = hwpx.hwpx_text(zin)
     comp = compile_rules()
@@ -97,7 +104,9 @@ def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:
                 seen.add(v); secrets.append(v)
     return secrets
 
+# --------------------------
 # 프리뷰 재생성 유틸(soffice → PDF → PNG)
+# --------------------------
 def _find_soffice() -> Optional[str]:
     candidates = [
         shutil.which("soffice"),
@@ -203,7 +212,9 @@ def _rewrite_zip_replacing_previews(
         os.path.basename(dst_path),
     )
 
+# --------------------------
 # 레닥션(파일→파일)
+# --------------------------
 def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
     comp = compile_rules()
     kind = detect_xml_type(filename)

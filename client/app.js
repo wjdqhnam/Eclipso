@@ -1,416 +1,395 @@
-const API_BASE = () => window.API_BASE || 'http://127.0.0.1:8000'
-const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
+// ===== helpers / config =====
+const API_BASE = window.API_BASE || "http://127.0.0.1:8000";
+const HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || "";
+const $ = (id) => document.getElementById(id);
 
-const $ = (sel) => document.querySelector(sel)
-const $$ = (sel) => Array.from(document.querySelectorAll(sel))
+const PREVIEW_ONLY_MATCHES = true;
 
-// 마지막 생성 산출물(파일 저장용)
-let __lastRedactedBlob = null
-let __lastRedactedName = 'redacted.bin'
-
-// HTML 이스케이프
-const esc = (s) =>
-  (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-
-// 배지 숫자 업데이트
-const badge = (sel, n) => {
-  const el = $(sel)
-  if (el) el.textContent = String(n ?? 0)
+function extOf(name) {
+  const m = (name || "").match(/\.([^.]+)$/);
+  return (m ? m[1] : "").toLowerCase();
 }
-
-// 아코디언 열고 닫기
-const setOpen = (name, open) => {
-  const cont =
-    name === 'pdf' ? $('#pdf-preview-block') : $(`#${name}-result-block`)
-  const body = $(`#${name}-body`)
-  const chev = document.querySelector(`[data-chevron="${name}"]`)
-  cont && cont.classList.remove('hidden')
-  body && body.classList.toggle('hidden', !open)
-  chev && chev.classList.toggle('rotate-180', !open)
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, (m) =>
+    ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[m])
+  );
 }
-
-// 전역 클릭으로 아코디언 토글
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-toggle]')
-  if (!btn) return
-  const name = btn.getAttribute('data-toggle')
-  const body = document.getElementById(`${name}-body`)
-  setOpen(name, body ? body.classList.contains('hidden') : true)
-})
-
-// ===== 규칙(정규식) 목록 로드 =====
-async function loadRules() {
-  try {
-    const r = await fetch(`${API_BASE()}/text/rules`)
-    if (!r.ok) throw 0
-    const rules = await r.json()
-    const box = $('#rules-container')
-    if (!box) return
-    box.innerHTML = ''
-    for (const rule of rules) {
-      const el = document.createElement('label')
-      el.className = 'flex items-center gap-2'
-      el.innerHTML = `<input type="checkbox" name="rule" value="${rule}" checked><span>${esc(
-        rule
-      )}</span>`
-      box.appendChild(el)
-    }
-  } catch {
-    console.warn('규칙 불러오기 실패')
+function downloadBlob(blob, filenameFromHeader) {
+  const a = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  if (filenameFromHeader) a.download = filenameFromHeader;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 800);
+}
+function setSaveVisible(show) {
+  const b = $("btn-save-redacted");
+  if (!b) return;
+  if (show) {
+    b.classList.remove("hidden");
+    b.disabled = false;
+  } else {
+    b.classList.add("hidden");
+    b.disabled = true;
   }
 }
 
-// 현재 체크된 규칙 이름 배열
+// ===== tones (칩 색상) =====
+const RULE_TONE = {
+  rrn: "background:#ede9fe;color:#4c1d95;",
+  fgn: "background:#ede9fe;color:#4c1d95;",
+  email: "background:#e0f2fe;color:#075985;",
+  phone_mobile: "background:#d1fae5;color:#065f46;",
+  phone_city: "background:#d1fae5;color:#065f46;",
+  card: "background:#ffedd5;color:#9a3412;",
+  passport: "background:#e0e7ff;color:#3730a3;",
+  driver_license: "background:#fce7f3;color:#9d174d;",
+  default: "background:#f3f4f6;color:#374151;",
+};
+const toneStyle = (rule) => RULE_TONE[rule] || RULE_TONE.default;
+
+// ===== masking =====
+const KEEP = new Set(["-", "_", " "]);
+function maskPreview(val, rule) {
+  if ((rule || "").toLowerCase() === "email") {
+    let out = "";
+    for (const ch of val || "") {
+      if (ch === "@") out += "@";
+      else if (/[A-Za-z0-9.]/.test(ch)) out += "*";
+      else out += ch;
+    }
+    return out;
+  }
+  let out = "";
+  for (const ch of val || "") {
+    if (/[A-Za-z0-9]/.test(ch)) out += "*";
+    else if (KEEP.has(ch)) out += ch;
+    else out += ch;
+  }
+  return out;
+}
+
+// ===== normalize & filter =====
+function normalizeMatchesText(fullText, matches) {
+  return (matches || []).map((m) => ({
+    ...m,
+    value:
+      (m.value && String(m.value).trim()) ||
+      (m.location &&
+        Number.isFinite(m.location.start) &&
+        Number.isFinite(m.location.end)
+        ? fullText.slice(m.location.start, m.location.end).trim()
+        : ""),
+  }));
+}
+function keepMeaningful(v) {
+  if (!v) return false;
+  return ((v.match(/[A-Za-z0-9]/g) || []).length >= 2);
+}
+
+// ===== group by rule =====
+function groupByRule(fullText, matches, { valid, masked }) {
+  // valid: 'ok' | 'ng' | 'all'
+  const groups = new Map();
+  const seen = new Set();
+
+  for (const m of matches || []) {
+    if (valid === "ok" && m.valid !== true) continue;
+    if (valid === "ng" && m.valid !== false) continue;
+
+    const rule = m.rule || "unknown";
+    let v = (m.value || "").trim();
+
+    if (
+      !v &&
+      m.location &&
+      Number.isFinite(m.location.start) &&
+      Number.isFinite(m.location.end)
+    ) {
+      v = fullText.slice(m.location.start, m.location.end).trim();
+    }
+    if (!keepMeaningful(v)) continue;
+
+    const show = masked ? maskPreview(v, rule) : v;
+    const key = `${rule}:${show}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const arr = groups.get(rule) || [];
+    arr.push(show);
+    groups.set(rule, arr);
+  }
+
+  return new Map(
+    [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+  );
+}
+
+// ===== tight preview (한 줄 = 한 카테고리) =====
+function buildPreviewHtml_Grouped(fullText, matches) {
+  const grouped = groupByRule(fullText, matches, {
+    valid: "ok",
+    masked: true,
+  });
+  if (!grouped.size)
+    return `<div style="font-size:12px;color:#9ca3af">감지된 항목 없음</div>`;
+
+  let html =
+    '<div style="font-size:13px;line-height:1.15;margin:0;padding:0">';
+  grouped.forEach((vals, rule) => {
+    const chips = vals
+      .map(
+        (v) =>
+          `<span style="display:inline-block;padding:1px 6px;border-radius:8px;${toneStyle(
+            rule
+          )};margin:0 4px 0 0;font-size:12px;">${escapeHtml(v)}</span>`
+      )
+      .join("");
+    html += `
+      <div style="margin:2px 0;padding:0;white-space:normal;">
+        <span style="display:inline-block;min-width:110px;color:#6b7280;font-size:12px;margin:0 6px 0 0;vertical-align:middle;">${escapeHtml(
+          rule
+        )}</span>
+        <span style="display:inline-block;vertical-align:middle;">${chips}</span>
+      </div>`;
+  });
+  html += "</div>";
+  return html;
+}
+
+// ===== chips list (하단 위젯) =====
+function renderDetectedLists(matches) {
+  const ok = (matches || []).filter((m) => m.valid === true);
+  const ng = (matches || []).filter((m) => m.valid === false);
+  renderRuleChips($("by-rule-ok"), ok, false);
+  renderRuleChips($("by-rule-ng"), ng, true);
+}
+function renderRuleChips(container, list, isNG = false) {
+  const by = new Map();
+  (list || []).forEach((m) => {
+    const k = m.rule || "unknown";
+    const arr = by.get(k) || [];
+    arr.push(m);
+    by.set(k, arr);
+  });
+  if (!list.length) {
+    container.innerHTML =
+      '<div style="font-size:12px;color:#6b7280">없음</div>';
+    return;
+  }
+  const sections = [];
+  by.forEach((arr, rule) => {
+    const seen = new Set();
+    const chips = [];
+    arr.forEach((m) => {
+      const raw = (m.value || "").trim();
+      if (!raw) return;
+      const key = `${rule}:${raw}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const extra = isNG ? "outline:1px solid #fca5a5;" : "";
+      chips.push(
+        `<span style="display:inline-block;padding:2px 8px;border-radius:9999px;${toneStyle(
+          rule
+        )};${extra}margin:2px 6px 2px 0;font-size:12px;">${escapeHtml(
+          raw
+        )}</span>`
+      );
+    });
+    sections.push(`
+      <div style="margin:4px 0 6px 0;line-height:1.15;">
+        <div style="font-size:12px;color:#6b7280;margin:0 0 2px 0;">${escapeHtml(
+          rule
+        )}</div>
+        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;">${chips.join(
+          ""
+        )}</div>
+      </div>
+    `);
+  });
+  container.innerHTML = sections.join("");
+}
+
+// ===== state =====
+let __lastRedactedBlob = null;
+let __lastRedactedName = "redacted.bin";
+
+// ===== rules UI =====
 function selectedRuleNames() {
-  return $$('input[name="rule"]:checked').map((el) => el.value)
+  return Array.from(
+    document.querySelectorAll('input[name="rule"]:checked')
+  ).map((el) => el.value);
 }
 
-// ===== 드롭존 =====
-function setupDropZone() {
-  const dz = $('#dropzone'),
-    input = $('#file'),
-    nameEl = $('#file-name'),
-    statusEl = $('#status')
-  if (!dz || !input) return
-
-  let depth = 0
-  const setActive = (on) => {
-    dz.classList.toggle('ring-2', on)
-    dz.classList.toggle('ring-blue-400', on)
-    dz.classList.toggle('bg-blue-50', on)
-  }
-  const showName = (f) => {
-    if (nameEl) nameEl.textContent = f ? `선택됨: ${f.name}` : ''
-  }
-
-  ;['dragover', 'drop'].forEach((ev) =>
-    window.addEventListener(ev, (e) => e.preventDefault())
-  )
-
-  dz.addEventListener('dragenter', (e) => {
-    e.preventDefault()
-    depth++
-    setActive(true)
-    e.dataTransfer && (e.dataTransfer.dropEffect = 'copy')
-  })
-  dz.addEventListener('dragover', (e) => {
-    e.preventDefault()
-    e.dataTransfer && (e.dataTransfer.dropEffect = 'copy')
-  })
-  ;['dragleave', 'dragend'].forEach((ev) =>
-    dz.addEventListener(ev, (e) => {
-      e.preventDefault()
-      depth = Math.max(0, depth - 1)
-      if (!depth) setActive(false)
-    })
-  )
-
-  dz.addEventListener('drop', (e) => {
-    e.preventDefault()
-    depth = 0
-    setActive(false)
-    const dt = e.dataTransfer
-    let file = (dt.files && dt.files[0]) || null
-    if (!file && dt.items) {
-      for (const it of dt.items) {
-        if (it.kind === 'file') {
-          const f = it.getAsFile()
-          if (f) {
-            file = f
-            break
-          }
-        }
-      }
-    }
-    if (!file) {
-      statusEl && (statusEl.textContent = '드래그한 항목이 파일이 아닙니다.')
-      return
-    }
-    const repl = new DataTransfer()
-    repl.items.add(file)
-    input.files = repl.files
-    input.dispatchEvent(new Event('change', { bubbles: true }))
-    showName(file)
-    statusEl &&
-      (statusEl.textContent = '파일 선택 완료 — 스캔 실행을 눌러주세요.')
-  })
-
-  input.addEventListener('change', (e) => showName(e.target.files?.[0] || null))
+// ===== init =====
+init();
+function init() {
+  bindUI();
+  setSaveVisible(false);
+}
+function bindUI() {
+  $("file").addEventListener("change", onFileChange);
+  $("btn-scan").addEventListener("click", onScanClick);
+  $("btn-save-redacted").addEventListener("click", onSaveClick);
 }
 
-// ===== PDF 미리보기 (레닥션 결과 첫 페이지만) =====
-async function renderRedactedPdfPreview(blob) {
-  const cv = $('#pdf-preview')
-  if (!cv) return
-  const g = cv.getContext('2d')
-  if (!blob) return g.clearRect(0, 0, cv.width, cv.height)
-  const pdf = await pdfjsLib.getDocument({ data: await blob.arrayBuffer() })
-    .promise
-  const page = await pdf.getPage(1)
-  const vp = page.getViewport({ scale: 1.2 })
-  cv.width = vp.width
-  cv.height = vp.height
-  await page.render({ canvasContext: g, viewport: vp }).promise
+// ===== file change =====
+function onFileChange() {
+  const f = $("file").files?.[0] || null;
+
+  $("redacted-preview").innerHTML = "";
+  $("txt-raw").value = "";
+  $("by-rule-ok").innerHTML = "";
+  $("by-rule-ng").innerHTML = "";
+  $("summary").textContent = "";
+  $("status").textContent = "";
+  $("file-info").textContent = "";
+  setSaveVisible(false);
+
+  if (!f) return;
+  $("file-info").textContent = `${f.name} · ${(
+    f.size / 1024
+  ).toFixed(1)} KB · ${extOf(f.name).toUpperCase()}`;
 }
 
-// ===== 정규식 결과 렌더 =====
-const take = (s, n) => (s.length <= n ? s : s.slice(0, n) + '…')
+// ===== actions =====
+async function onScanClick() {
+  const f = $("file").files?.[0];
+  if (!f) return alert("파일을 선택하세요.");
 
-function highlightFrag(ctx, val, pad = 60) {
-  const i = (ctx || '').indexOf(val || '')
-  if (i < 0) return esc(take(ctx || '', 140))
-  const start = Math.max(0, i - pad)
-  const end = Math.min((ctx || '').length, i + (val || '').length + pad)
-  const pre = esc((ctx || '').slice(start, i))
-  const mid = esc(val || '')
-  const post = esc((ctx || '').slice(i + (val || '').length, end))
-  return pre + `<mark class="bg-yellow-200 rounded px-1">${mid}</mark>` + post
-}
+  setSaveVisible(false);
 
-function renderRegexResults(res) {
-  const items = Array.isArray(res?.items) ? res.items : []
-  badge('#match-badge', items.length)
+  const ext = extOf(f.name);
+  const safeBase = f.name.replace(/\.[^.]+$/, "") || "redacted";
+  __lastRedactedName = `${safeBase}.${ext || "bin"}`;
 
-  const summary = $('#summary')
-  if (summary) {
-    const counts = res?.counts || {}
-    summary.textContent = `검출: ${
-      Object.keys(counts).length
-        ? Object.entries(counts)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(', ')
-        : '없음'
-    }`
-  }
+  setStatus("텍스트 추출 및 매칭 중...");
 
-  const wrap = $('#match-groups')
-  if (!wrap) return
-  wrap.innerHTML = ''
-
-  const groups = {}
-  for (const it of items) (groups[it.rule || 'UNKNOWN'] ??= []).push(it)
-  for (const [rule, arr] of Object.entries(groups).sort(
-    (a, b) => b[1].length - a[1].length
-  )) {
-    const ok = arr.filter((x) => x.valid).length
-    const fail = arr.length - ok
-
-    const container = document.createElement('div')
-    container.className = 'rounded-xl border border-gray-200 mb-3'
-    container.innerHTML = `
-      <button class="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 rounded-lg">
-        <div class="flex items-center gap-2">
-          <span class="text-sm font-semibold">${esc(rule)}</span>
-          <span class="text-xs text-gray-500">총 ${arr.length}건</span>
-          <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">OK ${ok}</span>
-          ${
-            fail
-              ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">FAIL ${fail}</span>`
-              : ''
-          }
-        </div>
-        <svg class="h-4 w-4 text-gray-500" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" clip-rule="evenodd"/></svg>
-      </button>
-      <div class="p-2"></div>
-    `
-    const body = container.querySelector('.p-2')
-    for (const r of arr) {
-      const card = document.createElement('div')
-      card.className = 'border rounded-lg p-3 mb-2'
-      card.dataset.valid = r.valid ? '1' : '0'
-      card.innerHTML = `
-        <div class="flex items-start justify-between gap-3">
-          <div class="min-w-0">
-            <div class="text-sm font-mono break-all">${esc(r.value || '')}</div>
-            <div class="text-[12px] text-gray-500 mt-1 leading-relaxed break-words">${highlightFrag(
-              r.context || '',
-              r.value || ''
-            )}</div>
-          </div>
-          <div class="text-xs ${
-            r.valid ? 'text-emerald-700' : 'text-rose-700'
-          } shrink-0">${r.valid ? 'OK' : 'FAIL'}</div>
-        </div>`
-      body.appendChild(card)
-    }
-    let open = arr.length <= 10
-    body.style.display = open ? '' : 'none'
-    container.querySelector('button')?.addEventListener('click', () => {
-      open = !open
-      body.style.display = open ? '' : 'none'
-      container.querySelector('svg')?.classList.toggle('rotate-180', !open)
-    })
-    wrap.appendChild(container)
-  }
-
-  $('#filter-valid-only')?.addEventListener('change', (e) => {
-    const on = e.target.checked
-    wrap.querySelectorAll('[data-valid]').forEach((el) => {
-      const ok = el.getAttribute('data-valid') === '1'
-      el.style.display = on && !ok ? 'none' : ''
-    })
-  })
-
-  $('#filter-search')?.addEventListener('input', (e) => {
-    const q = (e.target.value || '').toLowerCase()
-    wrap.querySelectorAll('.border.rounded-lg.p-3').forEach((el) => {
-      el.style.display =
-        q && !el.textContent.toLowerCase().includes(q) ? 'none' : ''
-    })
-  })
-}
-
-// ===== NER 테이블 렌더 =====
-function renderNerTable(ner) {
-  const rows = $('#ner-rows')
-  const sum = $('#ner-summary')
-  const allow = new Set()
-  $('#ner-show-ps')?.checked !== false && allow.add('PS')
-  $('#ner-show-lc')?.checked !== false && allow.add('LC')
-  $('#ner-show-og')?.checked !== false && allow.add('OG')
-
-  const items = (ner.items || []).filter((it) =>
-    allow.has((it.label || '').toUpperCase())
-  )
-  if (rows) rows.innerHTML = ''
-  for (const it of items) {
-    const tr = document.createElement('tr')
-    tr.className = 'border-b align-top'
-    tr.innerHTML = `
-      <td class="py-2 px-2 font-mono">${esc(it.label)}</td>
-      <td class="py-2 px-2 font-mono">${esc(it.text)}</td>
-      <td class="py-2 px-2 font-mono">${
-        typeof it.score === 'number' ? it.score.toFixed(2) : '-'
-      }</td>
-      <td class="py-2 px-2 font-mono">${it.start}-${it.end}</td>`
-    rows?.appendChild(tr)
-  }
-  badge('#ner-badge', items.length)
-  if (sum) {
-    const counts = {}
-    for (const it of items) counts[it.label] = (counts[it.label] || 0) + 1
-    sum.textContent = `검출: ${
-      Object.keys(counts).length
-        ? Object.entries(counts)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(', ')
-        : '없음'
-    }`
-  }
-}
-
-// ===== 상태 표시 =====
-function setStatus(msg) {
-  const el = $('#status')
-  if (el) el.textContent = msg || ''
-}
-
-// ===== 스캔 버튼 핸들러 =====
-$('#btn-scan')?.addEventListener('click', async () => {
-  const f = $('#file')?.files?.[0]
-  if (!f) return alert('파일을 선택하세요.')
-
-  // 출력 파일명 기본값 구성
-  const ext = (f.name.split('.').pop() || '').toLowerCase()
-  __lastRedactedName = f.name
-    ? f.name.replace(/\.[^.]+$/, `_redacted.${ext}`)
-    : `redacted.${ext}`
-
-  setStatus('텍스트 추출 및 매칭 중...')
-  const fd = new FormData()
-  fd.append('file', f)
-
-  // 결과 패널 보이기
-  $('#match-result-block')?.classList.remove('hidden')
-  $('#ner-result-block')?.classList.remove('hidden')
+  const fd = new FormData();
+  fd.append("file", f);
 
   try {
     // 1) 텍스트 추출
-    const r1 = await fetch(`${API_BASE()}/text/extract`, {
-      method: 'POST',
+    const extResp = await fetch(`${API_BASE}/text/extract`, {
+      method: "POST",
       body: fd,
-    })
-    if (!r1.ok)
-      throw new Error(`텍스트 추출 실패 (${r1.status})\n${await r1.text()}`)
-    const { full_text: text = '' } = await r1.json()
-
-    // 본문 프리뷰
-    $('#text-preview-block')?.classList.remove('hidden')
-    const ta = $('#txt-out')
-    if (ta) ta.value = text || '(본문 텍스트가 비어 있습니다.)'
-
-    // 2) 정규식 매칭
-    const rules = selectedRuleNames()
-    const r2 = await fetch(`${API_BASE()}/text/match`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, rules, normalize: true }),
-    })
-    if (!r2.ok) throw new Error(`매칭 실패 (${r2.status})\n${await r2.text()}`)
-    renderRegexResults(await r2.json())
-    setOpen('match', true)
-
-    // 3) NER
-    const r3 = await fetch(`${API_BASE()}/text/ner`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    })
-    const ner = r3.ok ? await r3.json() : { items: [], counts: {} }
-    renderNerTable(ner)
-    ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
-      $(sel)?.addEventListener('change', () => renderNerTable(ner))
-    )
-    setOpen('ner', true)
-
-    setStatus(`스캔 완료 (${ext.toUpperCase()} 처리)`)
-
-    // 4) 레닥션 파일 생성
-    setStatus('레닥션 파일 생성 중...')
-    const r4 = await fetch(`${API_BASE()}/redact/file`, {
-      method: 'POST',
-      body: fd,
-    })
-    if (!r4.ok) throw new Error(`레닥션 실패 (${r4.status})`)
-    const blob = await r4.blob()
-    const ctype = r4.headers.get('Content-Type') || 'application/octet-stream'
-    __lastRedactedBlob = new Blob([blob], { type: ctype })
-
-    // PDF면 미리보기
-    if (ctype.includes('pdf')) {
-      setOpen('pdf', true)
-      await renderRedactedPdfPreview(__lastRedactedBlob)
-    } else {
-      setOpen('pdf', false)
+    });
+    if (!extResp.ok) {
+      const msg = await extResp.text();
+      throw new Error(`텍스트 추출 실패 (${extResp.status})\n${msg}`);
     }
+    const extData = await extResp.json();
+    const fullText = extData.full_text || "";
 
-    // 저장 버튼 노출
-    const btn = $('#btn-save-redacted')
-    if (btn) {
-      btn.classList.remove('hidden')
-      btn.disabled = false
+    // 2) 매칭
+    const rules = selectedRuleNames();
+    const matchResp = await fetch(`${API_BASE}/text/match`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: fullText, rules, normalize: true }),
+    });
+    if (!matchResp.ok) {
+      const msg = await matchResp.text();
+      throw new Error(`매칭 실패 (${matchResp.status})\n${msg}`);
     }
+    const res = await matchResp.json();
 
-    setStatus('레닥션 완료 — 다운로드 가능')
-  } catch (e) {
-    console.error(e)
-    setStatus(`오류: ${e.message || e}`)
+    const matches = normalizeMatchesText(
+      fullText,
+      Array.isArray(res.items) ? res.items : []
+    );
+
+    // ── 상단 미리보기 (칩 그룹) ─────────────────────
+    const html = PREVIEW_ONLY_MATCHES
+      ? buildPreviewHtml_Grouped(fullText, matches)
+      : "";
+    $("redacted-preview").innerHTML = html;
+    const rp = $("redacted-preview");
+    rp.style.lineHeight = "1.15";
+    rp.style.padding = "4px 0";
+    rp.style.margin = "0";
+
+    // ── 하단 원본 텍스트: rule + 값 모아 보여주기 ─────
+    const allGrouped = groupByRule(fullText, matches, {
+      valid: "all",
+      masked: false,
+    });
+    const lines = [];
+    allGrouped.forEach((vals, rule) => {
+      lines.push(`${rule}`);
+      vals.forEach((v) => lines.push(`  ${v}`));
+      lines.push("");
+    });
+    while (lines.length && lines[lines.length - 1] === "") lines.pop();
+    $("txt-raw").value = lines.join("\n") || fullText;
+
+    // ── OK/FAIL 칩 리스트 ────────────────────────────
+    renderDetectedLists(matches);
+
+    // ── 요약: /text/match 가 준 counts 그대로 사용 ────
+    const counts = res.counts || {};
+    const summary =
+      Object.keys(counts).length === 0
+        ? "검출: 없음"
+        : "검출: " +
+          Object.entries(counts)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ");
+    $("summary").textContent = summary;
+
+    setStatus(`스캔 완료 (${ext.toUpperCase()} 처리)`);
+
+    // 3) 레닥션 파일 생성 (/redact/file 그대로 사용)
+    setStatus("레닥션 파일 생성 중...");
+    const { blob, filename } = await applyAndGetBlob(f);
+    __lastRedactedBlob = blob;
+    __lastRedactedName = filename;
+
+    setSaveVisible(true);
+    setStatus("레닥션 완료 — 다운로드 가능");
+  } catch (err) {
+    console.error(err);
+    setStatus(`오류: ${err.message || err}`);
   }
-})
+}
 
-// ===== 다운로드 버튼 =====
-$('#btn-save-redacted')?.addEventListener('click', () => {
-  if (!__lastRedactedBlob) return alert('레닥션된 파일이 없습니다.')
-  const url = URL.createObjectURL(__lastRedactedBlob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = __lastRedactedName || 'redacted_file'
-  a.click()
-  URL.revokeObjectURL(url)
-})
+async function applyAndGetBlob(file) {
+  const fd = new FormData();
+  fd.append("file", file);
 
-// ===== 초기화 =====
-document.addEventListener('DOMContentLoaded', () => {
-  loadRules()
-  setupDropZone()
-})
+  const res = await fetch(`${API_BASE}/redact/file`, {
+    method: "POST",
+    body: fd,
+  });
+  if (!res.ok) {
+    const msg = await res.text();
+    throw new Error(`레닥션 실패 (${res.status})\n${msg}`);
+  }
+
+  const blob = await res.blob();
+  const originalName = file.name || "";
+  const ex = extOf(originalName) || "bin";
+  const safeBase = originalName.replace(/\.[^.]+$/, "") || "redacted";
+  const filename = `${safeBase}.${ex}`;
+  return { blob, filename };
+}
+
+// 다운로드 버튼
+function onSaveClick() {
+  if (!__lastRedactedBlob)
+    return alert("레닥션된 파일이 없습니다. 먼저 스캔/레닥션을 수행하세요.");
+  downloadBlob(__lastRedactedBlob, __lastRedactedName);
+}
+
+// ===== status =====
+function setStatus(msg) {
+  $("status").textContent = msg || "";
+}

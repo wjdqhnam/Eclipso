@@ -1,3 +1,5 @@
+# server/modules/hwpx_module.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import io
@@ -6,7 +8,7 @@ import zipfile
 import logging
 from typing import Optional, List, Tuple
 
-#  common 유틸 임포트: 상대 경로 우선, 실패 시 절대경로 fallback 
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대경로 fallback ────────────────
 try:
     from .common import (
         cleanup_text,
@@ -30,7 +32,7 @@ except Exception:  # pragma: no cover
         HWPX_BLANK_PREVIEW,
     )
 
-# schemas 임포트: core 우선, 실패 시 대안 경로 시도 
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
 try:
     from ..core.schemas import XmlMatch, XmlLocation  # 일반적인 현재 리포 구조
 except Exception:
@@ -41,6 +43,9 @@ except Exception:
 
 log = logging.getLogger("xml_redaction")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HWPX 처리용: 레닥션 전 스캔에서 모은 시크릿(문자열)들을 저장했다가 OLE 프리뷰에도 반영
+# ─────────────────────────────────────────────────────────────────────────────
 _CURRENT_SECRETS: List[str] = []
 
 
@@ -50,7 +55,16 @@ def set_hwpx_secrets(values: List[str] | None):
     _CURRENT_SECRETS = list(dict.fromkeys(v for v in (values or []) if v))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 텍스트 수집: 본문 XML, 차트 XML, 내장 XLSX(sharedStrings, worksheets, charts)
+# ─────────────────────────────────────────────────────────────────────────────
 def hwpx_text(zipf: zipfile.ZipFile) -> str:
+    """
+    HWPX(zip)에서 텍스트를 모아 하나의 문자열로 합친다.
+    - Contents/*.xml: 본문
+    - Chart(s)/*.xml: 차트 라벨/값
+    - BinData/*: 내장 XLSX 안의 텍스트
+    """
     out: List[str] = []
 
     names = zipf.namelist()
@@ -108,13 +122,20 @@ def hwpx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(x for x in out if x))
 
 
-
-# /text/extract 용 텍스트 추출
+# ─────────────────────────────────────────────────────────────────────────────
+# /text/extract 용 텍스트 추출 (사람이 보기 좋게 정리)
+# ─────────────────────────────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
+    """
+    /text/extract 엔드포인트가 기대하는 형식으로 HWPX 텍스트를 반환.
+    - full_text: 전체 텍스트
+    - pages    : 페이지 배열 (HWPX는 페이지 개념이 없어 1페이지로 통합)
+    """
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         raw = hwpx_text(zipf)
 
     # 1) 차트/내장 XLSX 에서 섞여 들어온 XML 태그 제거
+    #    예: "<c:v>계열 1" -> "계열 1"
     txt = re.sub(r"<[^>\n]+>", "", raw)
 
     # 2) HWP 각주/주석 마커 줄 제거: "^1.", "^2)", "(^3)" 등
@@ -131,6 +152,7 @@ def extract_text(file_bytes: bytes) -> dict:
     txt = re.sub(r"\(\^\d+\)", "", txt)
 
     # 3) 엑셀 시트/범위 토큰 제거
+    #    예: "Sheet1!$B$1", "Sheet1!$B$2:$B$5"
     txt = re.sub(
         r"Sheet\d*!\$[A-Z]+\$\d+(?::\$[A-Z]+\$\d+)?",
         "",
@@ -152,8 +174,9 @@ def extract_text(file_bytes: bytes) -> dict:
     }
 
 
-
-# 스캔: 정규식 규칙으로 추출
+# ─────────────────────────────────────────────────────────────────────────────
+# 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보를 추출
+# ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = hwpx_text(zipf)
     comp = compile_rules()
@@ -225,8 +248,16 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "hwpx", text
 
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 파일 단위 레닥션
+# ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
+    """
+    filename: HWPX ZIP 내 엔트리 경로
+    data    : 원본 바이트
+    comp    : compile_rules() 결과
+    return  : 바이트를 반환하면 교체, None이면 원본 유지
+    """
     low = filename.lower()
 
     # 1) Preview 폴더: 내용 전부 제거 (텍스트/이미지 포함 전체 0바이트)

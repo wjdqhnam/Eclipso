@@ -1,9 +1,12 @@
+# server/modules/common.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io
 import re
 import zipfile
 from typing import List, Tuple, Optional, Callable
 
+# 올바른 경로: server/core/redaction_rules.py
 try:
     from ..core.redaction_rules import PRESET_PATTERNS, RULES
 except Exception:  # pragma: no cover
@@ -24,12 +27,12 @@ __all__ = [
     "HWPX_BLANK_PREVIEW",
 ]
 
-# 옵션(환경변수 대체·기본값)
+# ---------------- 옵션(환경변수 대체·기본값) ----------------
 HWPX_STRIP_PREVIEW = False
 HWPX_DISABLE_CACHE = True
 HWPX_BLANK_PREVIEW = True
 
-# 공통 유틸
+# ---------------- 공통 유틸 ----------------
 def cleanup_text(text: str) -> str:
     if not text:
         return ""
@@ -39,7 +42,7 @@ def cleanup_text(text: str) -> str:
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
 
-# 룰 컴파일 + 우선순위
+# ---------- 룰 컴파일 + 우선순위 ----------
 _RULE_PRIORITY = {
     "card": 100, "email": 90, "rrn": 80, "fgn": 80,
     "phone_mobile": 60, "phone_city": 60,
@@ -48,6 +51,20 @@ _RULE_PRIORITY = {
 
 
 def compile_rules() -> List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]]:
+    """
+    PRESET_PATTERNS + RULES 기반으로 레닥션용 규칙을 컴파일한다.
+
+    반환 형식:
+        [
+          (name, compiled_regex, need_valid, priority, validator),
+          ...
+        ]
+
+    - need_valid:
+        * PRESET_PATTERNS에 ensure_valid가 명시되어 있으면 그 값을 사용
+        * 그렇지 않고 RULES에 validator가 있으면 기본적으로 True
+        * validator도 없고 ensure_valid도 없으면 False
+    """
     comp: List[Tuple[str, re.Pattern, bool, int, Optional[Callable]]] = []
 
     for r in PRESET_PATTERNS:
@@ -97,7 +114,7 @@ def _is_valid(value: str, validator: Optional[Callable]) -> bool:
     except Exception:
         return False
 
-#마스킹(엔티티 보존)
+# ---------- 마스킹(엔티티 보존) ----------
 _ENTITY_RE = re.compile(r"&(#\d+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);")
 
 def _mask_preserving_entities(v: str, mask_char_fn) -> str:
@@ -128,6 +145,7 @@ def _mask_email(v: str) -> str:
 
 
 def _mask_keep_rules(v: str) -> str:
+    """공통: '-' 보존, 영숫자 및 '.' '_' 가림, 나머지 기호/공백 보존."""
     def _mask(ch: str) -> str:
         if ch == "-":
             return ch
@@ -140,7 +158,8 @@ def _mask_keep_rules(v: str) -> str:
 def _mask_value(rule: str, v: str) -> str:
     return _mask_email(v) if (rule or "").lower() == "email" else _mask_keep_rules(v)
 
-# 2-패스 토큰 스캔 유틸
+# ---------- 2-패스 토큰 스캔 유틸 ----------
+
 def _collect_spans(src: str, comp) -> tuple[List[tuple], List[tuple]]:
     """허용 구간(OK)과 금지 구간(FAIL)을 수집."""
     allowed: List[tuple] = []   # (s, e, rule, prio)
@@ -186,16 +205,24 @@ def _apply_spans(src: str, allowed) -> tuple[str, int]:
         hits += 1
     return "".join(out), hits
 
-# 텍스트 노드만 마스킹하는 2-패스
+# ---------- 핵심: 텍스트 노드만 마스킹하는 2-패스 ----------
 
 _TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.DOTALL)
 
 def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
+    """
+    XML(UTF-8 가정)에서 **태그 밖 텍스트 노드만** 토큰 단위로 2-패스 마스킹.
+
+    - 태그/속성(예: <c r="A1">, <row r="3">, 관계 ID 등)은 절대 건드리지 않음
+    - 엑셀 구조 깨짐 / 복구 팝업 방지용
+    """
     s = xml_bytes.decode("utf-8", "ignore")
 
     all_allowed: List[tuple] = []
     all_forbidden: List[tuple] = []
 
+    # 각각의 "텍스트 구간"에 대해서만 룰을 적용하고,
+    # 전역 문자열 오프셋으로 다시 합친다.
     for m in _TEXT_NODE_RE.finditer(s):
         txt = m.group(1)
         if not txt:
@@ -214,9 +241,10 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     masked, hits = _apply_spans(s, all_allowed)
     return masked.encode("utf-8", "ignore"), hits
 
-# 차트 관련
+# ---------- 차트 관련 ----------
 
 def chart_rels_sanitize(rels_bytes: bytes) -> Tuple[bytes, int]:
+    # 현재는 noop. 향후 dangling 관계 정리 로직을 넣을 수 있음.
     return rels_bytes, 0
 
 
@@ -224,11 +252,11 @@ def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     """차트 XML도 동일 정책으로 텍스트만 마스킹."""
     return sub_text_nodes(xml_bytes, comp)
 
-#DOCX [Content_Types].xml 보정(스텁) 
+# ---------- DOCX [Content_Types].xml 보정(스텁) ----------
 def sanitize_docx_content_types(xml_bytes: bytes) -> bytes:
     return xml_bytes
 
-#XLSX 텍스트 수집
+# ---------- XLSX 텍스트 수집 ----------
 def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
     out: List[str] = []
     try:
@@ -267,8 +295,12 @@ def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
 
     return cleanup_text("\n".join(out))
 
-#OOXML 내장 XLSX 레닥션
+# ---------- OOXML 내장 XLSX 레닥션 ----------
 def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
+    """
+    OOXML(예: docx/pptx) 안에 포함된 .xlsx를 레닥션.
+    구조(relationship, 주소 등)를 건드리지 않고 텍스트 노드만 마스킹한다.
+    """
     comp = compile_rules()
     bio_in = io.BytesIO(xlsx_bytes)
     bio_out = io.BytesIO()

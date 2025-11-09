@@ -1,8 +1,10 @@
+# server/modules/xlsx_module.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io, zipfile
 from typing import List, Tuple
 
-# common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback 
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
 try:
     from .common import (
         cleanup_text,
@@ -22,7 +24,7 @@ except Exception:  # pragma: no cover - 패키지 구조 달라졌을 때 대비
         chart_rels_sanitize,
     )
 
-# schemas 임포트: core 우선, 실패 시 대안 경로 시도
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
 try:
     from ..core.schemas import XmlMatch, XmlLocation  # 일반적인 현재 리포 구조
 except Exception:
@@ -32,7 +34,7 @@ except Exception:
         from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
 
 
-# RULES(validator) 접근
+# ── RULES(validator) 접근 ─────────────────────────────────────────────────────
 try:
     from ..core.redaction_rules import RULES
 except Exception:
@@ -43,10 +45,11 @@ except Exception:
 
 
 def xlsx_text(zipf: zipfile.ZipFile) -> str:
+    """XLSX(zip)에서 텍스트를 모아 하나의 문자열로 합칩니다."""
     return xlsx_text_from_zip(zipf)
 
 
-# /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
+# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
 def extract_text(file_bytes: bytes) -> dict:
     """바이트로 들어온 XLSX에서 텍스트만 추출."""
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
@@ -68,7 +71,9 @@ def _get_validator(rule_name: str):
     return v if callable(v) else None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보를 추출
+# ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = xlsx_text(zipf)
     comp = compile_rules()
@@ -122,7 +127,9 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "xlsx", text
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # 파일 단위 레닥션: 시트/공유문자열/차트/차트.rels 처리
+# ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
 

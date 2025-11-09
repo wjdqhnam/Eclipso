@@ -1,3 +1,13 @@
+# -*- coding: utf-8 -*-
+"""
+OLE(CFBF) 스트림 동일 길이 마스킹 + FAT/MiniFAT 브루트포스 쓰기 + 상세 로그.
+중요: 차트 역노출 방지 위해 OlePres***, Contents, OOXMLChartContents 는 무조건 제로필.
+
+환경변수:
+- OLE_MASK_PREVIEW=1  → (레거시) OlePres*** 블랭크. (mask_preview 인자와 병행)
+- OLE_DEBUG_DUMP=1    → ./_ole_debug/<stamp>/ 에 before/after 덤프 저장
+"""
+
 from __future__ import annotations
 
 import io
@@ -311,6 +321,12 @@ def _probe_set(secrets: List[str]) -> Dict[str, List[bytes]]:
 
 # ------------- 메인: 프리뷰/콘텐츠 스트림 제로필 + 파이프라인 -------------
 def redact_ole_bin_preserve_size(bin_bytes: bytes, secrets: List[str], *, mask_preview: bool = False) -> bytes:
+    """
+    HWPX BinData/ole*.ole 바이너리에서 민감정보 제거.
+    - OlePres***, Contents, OOXMLChartContents ⇒ 무조건 제로필
+    - 그 외 스트림 ⇒ 시크릿/이메일 동일길이 마스킹
+    (길이 유지 보정 포함)
+    """
     if not isinstance(bin_bytes, (bytes, bytearray, memoryview)) or len(bin_bytes) < 8:
         return bytes(bin_bytes)
 

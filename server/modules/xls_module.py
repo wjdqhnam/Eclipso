@@ -109,6 +109,7 @@ def extract_text_from_xls(file_bytes: bytes):
 
 
 def redact(file_bytes: bytes) -> bytes:
+    """XLS 포맷 유지형: SST / LABELSST 내 문자열 교체"""
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):
             return file_bytes
@@ -136,4 +137,5 @@ def redact(file_bytes: bytes) -> bytes:
     return bytes(wb)
 
 def extract_text(file_bytes: bytes) -> dict:
+    """text_api.py 에서 호출되는 공통 인터페이스"""
     return extract_text_from_xls(file_bytes)

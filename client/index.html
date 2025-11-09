@@ -8,318 +8,178 @@
     <!-- Tailwind & PDF.js -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-
     <script>
-      // API_BASE 자동 설정 (로컬/배포 공용)
-      const origin = window.location.origin
-      window.API_BASE =
-        origin.includes('127.0.0.1') || origin.includes('localhost')
-          ? 'http://127.0.0.1:8000'
-          : origin.replace(/\/$/, '')
+      // API_BASE 자동 결정 (로컬/배포 공용)
+      const origin = window.location.origin;
+      if (origin.includes("127.0.0.1") || origin.includes("localhost")) {
+        window.API_BASE = "http://127.0.0.1:8000";
+      } else {
+        window.API_BASE = origin.replace(/\/$/, "");
+      }
 
-      // HWPX 뷰어 URL 사용 시 여기에 지정(선택)
-      window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
+      // (옵션) HWPX 뷰어 URL 쓰고 싶으면 여기서 세팅 가능
+      window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || "";
 
-      // pdf.js 워커 경로 설정
+      // pdf.js 워커 설정
       pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
     </script>
+
+    <style>
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+      }
+      .pill {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 12px;
+        line-height: 1.2;
+        white-space: nowrap;
+      }
+    </style>
   </head>
 
   <body class="bg-gray-50 text-gray-900">
-    <!-- 상단바 -->
-    <header class="border-b border-gray-200 bg-white/70 backdrop-blur">
-      <div
-        class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between"
-      >
-        <div class="flex items-center gap-2">
-          <div class="h-6 w-6 rounded-full bg-blue-600"></div>
-          <h1 class="text-xl font-semibold tracking-tight">Eclipso</h1>
-        </div>
-        <div class="text-sm text-gray-500">문서 개인정보 스캔 · 레닥션</div>
-      </div>
-    </header>
+    <div class="max-w-7xl mx-auto p-6">
+      <h1 class="text-2xl font-bold mb-4">Eclipso</h1>
 
-    <main class="max-w-7xl mx-auto px-6 py-8">
-      <div class="grid grid-cols-1 lg:grid-cols-[320px,1fr] gap-8">
-        <!-- 왼쪽: 업로드·옵션 -->
-        <aside class="lg:sticky lg:top-6 self-start space-y-6">
-          <section
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 space-y-5"
-          >
-            <!-- 파일 업로드 -->
-            <div>
-              <label class="block text-sm font-medium mb-2">파일 업로드</label>
-              <label
-                id="dropzone"
-                for="file"
-                class="block cursor-pointer rounded-xl border-2 border-dashed border-gray-300 hover:border-gray-400 bg-gray-50 px-4 py-6 text-center transition"
-                role="button"
-                tabindex="0"
-              >
-                <div class="text-sm text-gray-500">
-                  여기로 드래그하거나 클릭해서 선택
-                </div>
-                <div id="file-name" class="mt-2 text-xs text-gray-400"></div>
-              </label>
-              <input
-                id="file"
-                type="file"
-                accept=".pdf,.doc,.ppt,.xls,.hwp,.txt,.docx,.pptx,.xlsx,.hwpx"
-                class="sr-only"
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- 좌측 패널 -->
+        <div class="bg-white rounded-2xl shadow p-5 space-y-4">
+          <div>
+            <label class="block text-sm font-semibold mb-1">파일 업로드</label>
+            <input
+              id="file"
+              type="file"
+              accept=".pdf,.doc,.ppt,.xls,.hwp,.docx,.xlsx,.pptx,.hwpx"
+              class="block w-full border rounded p-2 bg-white"
+            />
+            <p class="text-[12px] text-gray-500 mt-1">
+              PDF / DOC / PPT / XLS / HWP / DOCX / XLSX / PPTX / HWPX 지원
+            </p>
+          </div>
+
+          <fieldset class="border rounded p-3">
+            <legend class="text-sm font-semibold">규칙 선택</legend>
+
+            <label class="block"
+              ><input type="checkbox" name="rule" value="rrn" checked />
+              주민등록번호</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="fgn" checked />
+              외국인등록번호</label
+            >
+            <label class="block"
+              ><input
+                type="checkbox"
+                name="rule"
+                value="phone_mobile"
+                checked
               />
+              휴대전화(010)</label
+            >
+            <label class="block"
+              ><input
+                type="checkbox"
+                name="rule"
+                value="phone_city"
+                checked
+              />
+              지역전화(02/031~064)</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="email" checked />
+              이메일</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="card" checked />
+              카드번호</label
+            >
+            <label class="block"
+              ><input type="checkbox" name="rule" value="passport" checked />
+              여권번호</label
+            >
+            <label class="block"
+              ><input
+                type="checkbox"
+                name="rule"
+                value="driver_license"
+                checked
+              />
+              운전면허번호</label
+            >
+
+            <p class="text-[12px] text-gray-500 mt-2">
+              * 선택 안 하면 서버 PRESET 전체가 사용됩니다.
+            </p>
+          </fieldset>
+
+          <div class="space-y-2">
+            <button
+              id="btn-scan"
+              class="w-full px-4 py-2 rounded bg-blue-600 text-white"
+            >
+              스캔 실행
+            </button>
+            <button
+              id="btn-save-redacted"
+              class="w-full px-4 py-2 rounded border hidden"
+              disabled
+            >
+              레닥션 파일 저장
+            </button>
+            <span id="status" class="block text-sm text-gray-600"></span>
+          </div>
+        </div>
+
+        <!-- 우측 패널 -->
+        <div class="lg:col-span-2 space-y-6">
+          <!-- 레닥션 미리보기 (칩/그룹 형태) -->
+          <div class="bg-white rounded-2xl shadow p-5">
+            <div class="flex items-center justify-between">
+              <h2 class="font-semibold mb-2">레닥션 미리보기</h2>
+              <div id="file-info" class="text-sm text-gray-600"></div>
             </div>
+            <div
+              id="redacted-preview"
+              class="mono whitespace-pre-wrap border rounded p-3 text-sm min-h-[12rem]"
+            ></div>
+          </div>
 
-            <!-- 규칙(정규식) -->
-            <fieldset class="rounded-xl border border-gray-200 p-4">
-              <legend class="px-1 text-sm font-medium">규칙 선택</legend>
-              <div id="rules-container" class="mt-2 space-y-2 text-sm">
-                <!-- 서버에서 /text/rules 로드. 실패 시 기본 샘플 -->
-                <label class="flex items-center gap-2">
-                  <input type="checkbox" name="rule" value="rrn" checked />
-                  <span>주민등록번호</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input type="checkbox" name="rule" value="fgn" checked />
-                  <span>외국인등록번호</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    name="rule"
-                    value="phone_mobile"
-                    checked
-                  />
-                  <span>휴대전화</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    name="rule"
-                    value="phone_city"
-                    checked
-                  />
-                  <span>지역전화</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input type="checkbox" name="rule" value="email" checked />
-                  <span>이메일</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input type="checkbox" name="rule" value="card" checked />
-                  <span>카드번호</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input type="checkbox" name="rule" value="passport" checked />
-                  <span>여권번호</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    name="rule"
-                    value="driver_license"
-                    checked
-                  />
-                  <span>운전면허번호</span>
-                </label>
-              </div>
-            </fieldset>
-
-            <!-- NER 표시(필터) -->
-            <fieldset class="rounded-xl border border-gray-200 p-4">
-              <legend class="px-1 text-sm font-medium">NER</legend>
-              <div class="mt-2 space-y-2 text-sm">
-                <label class="flex items-center gap-2">
-                  <input id="ner-show-ps" type="checkbox" checked />
-                  <span>이름(PS)</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input id="ner-show-lc" type="checkbox" checked />
-                  <span>주소·지명(LC)</span>
-                </label>
-                <label class="flex items-center gap-2">
-                  <input id="ner-show-og" type="checkbox" checked />
-                  <span>기관(OG)</span>
-                </label>
-              </div>
-            </fieldset>
-
-            <!-- 실행/다운로드 -->
-            <div class="space-y-2">
-              <button
-                id="btn-scan"
-                class="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition"
-              >
-                스캔 실행
-              </button>
-              <button
-                id="btn-save-redacted"
-                class="w-full px-4 py-2.5 rounded-lg border border-gray-300 hover:bg-gray-50 transition hidden"
-                disabled
-              >
-                레닥션 결과 다운로드
-              </button>
-            </div>
-
-            <!-- 상태표시 -->
-            <div class="rounded-lg bg-gray-50 px-3 py-2 text-sm">
-              <span id="status" class="text-gray-500">대기 중</span>
-            </div>
-          </section>
-        </aside>
-
-        <!-- 오른쪽: 결과 -->
-        <section class="space-y-8">
-          <!-- 텍스트 미리보기 -->
-          <div
-            id="text-preview-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 hidden"
-          >
-            <h2 class="font-semibold mb-2">텍스트 미리보기</h2>
+          <!-- 원본 추출 텍스트 (룰별 값 리스트) -->
+          <div class="bg-white rounded-2xl shadow p-5">
+            <h2 class="font-semibold mb-2">원본 추출 텍스트</h2>
             <textarea
-              id="txt-out"
-              class="w-full h-48 border rounded p-2 font-mono"
+              id="txt-raw"
+              class="w-full h-48 border rounded p-2 mono"
               readonly
             ></textarea>
           </div>
 
-          <!-- 매칭 결과(토글) -->
-          <div
-            id="match-result-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
-          >
-            <button
-              data-toggle="match"
-              class="w-full flex items-center justify-between px-5 py-3"
-            >
-              <h2 class="font-semibold">매칭 결과</h2>
-              <div class="flex items-center gap-3">
-                <span
-                  id="match-badge"
-                  class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
-                  >0</span
-                >
-                <svg
-                  data-chevron="match"
-                  class="h-5 w-5 text-gray-500 transition-transform"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-              </div>
-            </button>
-            <div id="match-body" class="p-5 border-t">
-              <div class="flex flex-wrap items-center gap-2 mb-4">
-                <div id="summary" class="text-sm text-gray-500"></div>
-                <span class="mx-2 text-gray-300">|</span>
-                <label class="text-sm flex items-center gap-1">
-                  <input
-                    id="filter-valid-only"
-                    type="checkbox"
-                    class="rounded border-gray-300"
-                  />
-                  Valid=OK만
-                </label>
-                <input
-                  id="filter-search"
-                  type="text"
-                  placeholder="텍스트 검색"
-                  class="text-sm border rounded px-2 py-1"
-                  style="min-width: 220px"
-                />
-              </div>
-              <div id="match-groups" class="space-y-3"></div>
+          <!-- 감지된 항목 (OK / FAIL 분리) -->
+          <div class="bg-white rounded-2xl shadow p-5">
+            <div class="flex items-center justify-between">
+              <h2 class="font-semibold mb-2">감지된 항목 (원본)</h2>
+              <div id="summary" class="text-sm text-gray-700"></div>
             </div>
-          </div>
 
-          <!-- NER 결과(토글) -->
-          <div
-            id="ner-result-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
-          >
-            <button
-              data-toggle="ner"
-              class="w-full flex items-center justify-between px-5 py-3"
-            >
-              <h2 class="font-semibold">NER 결과</h2>
-              <div class="flex items-center gap-3">
-                <span
-                  id="ner-badge"
-                  class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
-                  >0</span
-                >
-                <svg
-                  data-chevron="ner"
-                  class="h-5 w-5 text-gray-500 transition-transform"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-              </div>
-            </button>
-            <div id="ner-body" class="p-5 border-t">
-              <div id="ner-summary" class="text-sm text-gray-500 mb-3"></div>
-              <div class="overflow-auto">
-                <table class="min-w-full text-sm">
-                  <thead>
-                    <tr class="border-b bg-gray-50">
-                      <th class="text-left py-2 px-2">Label</th>
-                      <th class="text-left py-2 px-2">Text</th>
-                      <th class="text-left py-2 px-2">Score</th>
-                      <th class="text-left py-2 px-2">Pos</th>
-                    </tr>
-                  </thead>
-                  <tbody id="ner-rows"></tbody>
-                </table>
-              </div>
-            </div>
-          </div>
+            <h3 class="text-sm font-semibold mb-2 text-emerald-700">
+              유효(OK)
+            </h3>
+            <div id="by-rule-ok" class="space-y-3 mb-6"></div>
 
-          <!-- PDF 미리보기(토글) -->
-          <div
-            id="pdf-preview-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
-          >
-            <button
-              data-toggle="pdf"
-              class="w-full flex items-center justify-between px-5 py-3"
-            >
-              <h2 class="font-semibold">레닥션 미리보기 (PDF)</h2>
-              <svg
-                data-chevron="pdf"
-                class="h-5 w-5 text-gray-500 transition-transform"
-                viewBox="0 0 20 20"
-                fill="currentColor"
-              >
-                <path
-                  fill-rule="evenodd"
-                  d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
-                  clip-rule="evenodd"
-                />
-              </svg>
-            </button>
-            <div id="pdf-body" class="p-5 border-t hidden">
-              <canvas
-                id="pdf-preview"
-                class="w-full rounded border border-gray-200"
-              ></canvas>
-            </div>
+            <h3 class="text-sm font-semibold mb-2 text-red-700">
+              무효(FAIL)
+            </h3>
+            <div id="by-rule-ng" class="space-y-3"></div>
           </div>
-        </section>
+        </div>
       </div>
-    </main>
+    </div>
 
-    <!-- 앱 스크립트 -->
     <script type="module" src="./app.js"></script>
   </body>
 </html>

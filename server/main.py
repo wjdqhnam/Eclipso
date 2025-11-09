@@ -20,7 +20,7 @@ app.include_router(ner_api.router)
 
 @app.get("/", include_in_schema=False)
 async def root():
-    return {"message": "Eclipso Redaction Server is running"}
+    return {"message": "Eclipso Redaction Server is running", "docs": "/docs"}
 
 @app.get("/health", include_in_schema=False)
 async def health():
