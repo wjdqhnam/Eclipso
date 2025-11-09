@@ -1,11 +1,9 @@
-# server/modules/hwp_module.py
 from __future__ import annotations
 import io, zlib, struct
 from typing import List, Tuple
 import olefile
 
-# 정규식 매칭 원문 스팬 사용
-from server.core.matching import find_sensitive_spans  # 원문 스팬 반환 :contentReference[oaicite:2]{index=2}
+from server.core.matching import find_sensitive_spans  
 
 TAG_PARA_TEXT = 67
 
@@ -118,14 +116,13 @@ def extract_text(file_bytes: bytes) -> dict:
     return {"full_text": full, "pages": [{"page": 1, "text": full}]}
 
 def _collect_targets_by_regex(text: str) -> List[str]:
-    res = find_sensitive_spans(text)  # (start,end,value,rule) 리스트 :contentReference[oaicite:3]{index=3}
+    res = find_sensitive_spans(text) 
     targets: List[str] = []
     for s, e, _val, _rule in res:
         if isinstance(s, int) and isinstance(e, int) and e > s:
             frag = text[s:e]
             if frag and len(frag.strip()) >= 1:
                 targets.append(frag)
-    # 중복 제거(길이 긴 것 우선)
     targets = sorted(set(targets), key=lambda x: (-len(x), x))
     return targets
 
@@ -159,7 +156,7 @@ def _replace_in_bindata(raw: bytes, t: str) -> Tuple[bytes, int]:
 def redact(file_bytes: bytes) -> bytes:
     container = bytearray(file_bytes)
     full = extract_text(file_bytes)["full_text"]
-    targets = _collect_targets_by_regex(full)  # 원문 스팬 전체 사용
+    targets = _collect_targets_by_regex(full) 
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         streams = ole.listdir(streams=True, storages=False)
