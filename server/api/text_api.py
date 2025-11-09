@@ -10,6 +10,7 @@ from server.api.redaction_api import match_text
 from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
 from server.modules import pdf_module
 from server.utils.file_reader import extract_from_file 
+
 router = APIRouter(prefix="/text", tags=["text"])
 
 
@@ -31,35 +32,15 @@ def _ensure_full_text_payload(raw: Any) -> Dict[str, str]:
 @router.post(
     "/extract",
     summary="파일에서 텍스트 추출",
-    description="업로드한 문서에서 본문 텍스트를 추출하여 항상 {'full_text': ...}로 반환"
+    description="업로드한 문서에서 본문 텍스트를 추출하여 반환"
 )
-async def extract_text(file: UploadFile = File(...)):
+async def extract_text(file: UploadFile):
     try:
-        ext = Path(file.filename or "").suffix.lower()
-        data = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="빈 파일입니다.")
-
-
-        if ext == ".pdf":
-            text = pdf_module.extract_text(data)  
-            return {"full_text": text or ""}
-
-        try:
-            res = await extract_from_file(file)
-        except TypeError:
-            with tempfile.TemporaryDirectory() as td:
-                src = os.path.join(td, f"src{ext or ''}")
-                with open(src, "wb") as f:
-                    f.write(data)
-                res = {"full_text": ""}
-
-        return _ensure_full_text_payload(res)
-
-    except HTTPException:
-        raise
+        return await extract_from_file(file)
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"서버 내부 오류: {e}")
+        raise HTTPException(500, detail=f"서버 내부 오류: {e}")
 
 
 @router.get(

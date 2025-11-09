@@ -211,13 +211,8 @@ def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> b
                     continue
                 rects = page.search_for(frag)
                 for r in rects:
-                    if s.get("decision") == "highlight":
-                        annot = page.add_highlight_annot(r)
-                        annot.set_colors(stroke=(1, 1, 0))
-                        annot.set_opacity(0.45)
-                        annot.update()
-                    else:
-                        page.add_redact_annot(r, fill=(0, 0, 0))
+                    # 항상 검정 마스킹 처리
+                    page.add_redact_annot(r, fill=(0, 0, 0))
 
         # 페이지 단위 적용
         for page in doc:

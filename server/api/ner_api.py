@@ -33,9 +33,7 @@ async def health() -> Dict[str, Any]:
 @router.post(
     "/predict",
     summary="NER 호출 프록시",
-    description="""본문 NER 예측. 입력: text, labels(옵션).
-외부 NER API로 위임.
-응답: ok, latency_ms, raw(원본 응답).
+    description="""본문 NER 예측. 입력: text, labels
 
 테스트 예시:
 { "text": "홍길동의 이메일은 test@example.com 입니다.", "labels": ["PS","email","LC"] }""",
