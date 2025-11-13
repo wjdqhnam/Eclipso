@@ -1,5 +1,3 @@
-# server/modules/pdf_module.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import io
@@ -28,17 +26,6 @@ log_prefix = "[PDF]"
 # /text/extract 용 텍스트 추출
 # ─────────────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
-    """
-    PDF에서 텍스트를 추출해 /text/extract 형식으로 반환.
-
-    {
-      "full_text": "...",
-      "pages": [
-        {"page": 1, "text": "..."},
-        ...
-      ]
-    }
-    """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
         pages = []
@@ -67,11 +54,6 @@ def extract_text(file_bytes: bytes) -> dict:
 def _normalize_pattern_names(
     patterns: List[PatternItem] | None,
 ) -> Optional[Set[str]]:
-    """
-    /redactions/pdf/scan 에서 넘어온 patterns 는 PRESET 기반이므로
-    이름만 추려서 서버쪽 compile_rules 결과를 필터링하는 데만 쓴다.
-    (regex 문자열은 서버 PRESET 과 동일하다고 가정하고 무시)
-    """
     if not patterns:
         return None
 
@@ -84,11 +66,6 @@ def _normalize_pattern_names(
 
 
 def _is_valid_value(need_valid: bool, validator, value: str) -> bool:
-    """
-    compile_rules() 가 넘겨준 need_valid / validator 를 그대로 사용.
-    - need_valid == False → validator 무시, 항상 OK
-    - need_valid == True  → validator 가 있으면 돌려서 True 일 때만 OK
-    """
     if not need_valid or not callable(validator):
         return True
     try:
@@ -103,20 +80,52 @@ def _is_valid_value(need_valid: bool, validator, value: str) -> bool:
         return False
 
 
+def _merge_card_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
+    if len(rects) <= 1:
+        return rects
+
+    # y, x 기준으로 정렬
+    rects_sorted = sorted(rects, key=lambda r: (r.y0, r.x0))
+
+    line_clusters: List[List[fitz.Rect]] = []
+    current_cluster: List[fitz.Rect] = [rects_sorted[0]]
+
+    # 라인 y 허용 오차 (포인트 단위)
+    Y_TOL = 2.0
+
+    for r in rects_sorted[1:]:
+        last = current_cluster[-1]
+        if abs(r.y0 - last.y0) <= Y_TOL:
+            # 같은 줄이라고 보고 같은 클러스터에 추가
+            current_cluster.append(r)
+        else:
+            # 다른 줄로 판단 → 클러스터 종료
+            line_clusters.append(current_cluster)
+            current_cluster = [r]
+    line_clusters.append(current_cluster)
+
+    merged: List[fitz.Rect] = []
+
+    for cluster in line_clusters:
+        if len(cluster) == 1:
+            merged.append(cluster[0])
+        else:
+            x0 = min(r.x0 for r in cluster)
+            y0 = min(r.y0 for r in cluster)
+            x1 = max(r.x1 for r in cluster)
+            y1 = max(r.y1 for r in cluster)
+            merged.append(fitz.Rect(x0, y0, x1, y1))
+
+    return merged
+
+
 # ─────────────────────────────────────────────────────────────
 # PDF 내 박스 탐지
-#  - compile_rules() 기반 + validator 결과를 그대로 사용
-#  - FAIL(validator False) 인 값은 **절대로 박스 만들지 않음**
 # ─────────────────────────────────────────────────────────────
 def detect_boxes_from_patterns(
     pdf_bytes: bytes,
     patterns: List[PatternItem] | None,
 ) -> List[Box]:
-    """
-    patterns:
-      - None        → 서버 PRESET 전체 사용
-      - PatternItem → name 만 사용해서 subset 필터링
-    """
     # 1) 서버 기준 규칙(validator 포함) 가져오기
     comp = compile_rules()  # [(name, rx, need_valid, prio, validator), ...]
     allowed_names = _normalize_pattern_names(patterns)
@@ -176,7 +185,14 @@ def detect_boxes_from_patterns(
                         continue
 
                     # 실제 박스 찾기
-                    rects = page.search_for(val)
+                    rects = list(page.search_for(val))
+                    if not rects:
+                        continue
+
+                    # 카드번호(특히 하이픈 없는 형태) → 줄 단위로만 합치기
+                    if rule_name == "card" and "-" not in val and len(rects) > 1:
+                        rects = _merge_card_rects(rects)
+
                     for r in rects:
                         print(
                             f"{log_prefix} BOX",
@@ -230,19 +246,6 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> 
 
 
 def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> bytes:
-    """
-    PRESET_PATTERNS 기반 텍스트 레닥션.
-
-    ※ 중요:
-      - 여기서는 **regex + validator 기반 박스만 사용**한다.
-      - extra_spans(NER / 기타 매칭 결과)는 PDF 레닥션에서는
-        FAIL/OK 구분이 확실하지 않아서 현재는 *레닥션에 사용하지 않는다*.
-        (필요하면 나중에 valid=True 인 것만 별도 하이라이트 용도로 쓸 수 있음)
-    """
-    # PRESET 전체를 PatternItem 형태로 만들어서 이름만 넘김
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
-
-    # extra_spans 는 지금 단계에서는 완전히 무시
-    # (FAIL 이라도 강제로 들어오는 걸 막기 위해)
     return apply_redaction(pdf_bytes, boxes)

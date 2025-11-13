@@ -1,4 +1,3 @@
-# server/modules/pptx_module.py
 from __future__ import annotations
 
 import io
@@ -17,8 +16,8 @@ try:
         xlsx_text_from_zip,
         redact_embedded_xlsx_bytes,
     )
-except Exception:  # pragma: no cover
-    from server.modules.common import (  # type: ignore
+except Exception: 
+    from server.modules.common import (
         cleanup_text,
         compile_rules,
         sub_text_nodes,
@@ -33,9 +32,9 @@ try:
     from ..core.schemas import XmlMatch, XmlLocation
 except Exception:
     try:
-        from ..schemas import XmlMatch, XmlLocation  # type: ignore
+        from ..schemas import XmlMatch, XmlLocation 
     except Exception:
-        from server.core.schemas import XmlMatch, XmlLocation  # type: ignore
+        from server.core.schemas import XmlMatch, XmlLocation  
 
 
 def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:

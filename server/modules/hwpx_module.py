@@ -6,7 +6,7 @@ import zipfile
 import logging
 from typing import Optional, List, Tuple
 
-#  common 유틸 임포트: 상대 경로 우선, 실패 시 절대경로 fallback 
+# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대경로 fallback ────────────────
 try:
     from .common import (
         cleanup_text,
@@ -18,8 +18,8 @@ try:
         HWPX_DISABLE_CACHE,
         HWPX_BLANK_PREVIEW,
     )
-except Exception:  # pragma: no cover
-    from server.modules.common import (  # type: ignore
+except Exception:
+    from server.modules.common import (
         cleanup_text,
         compile_rules,
         sub_text_nodes,
@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
         HWPX_BLANK_PREVIEW,
     )
 
-# schemas 임포트: core 우선, 실패 시 대안 경로 시도 
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
 try:
     from ..core.schemas import XmlMatch, XmlLocation  # 일반적인 현재 리포 구조
 except Exception:
@@ -41,6 +41,9 @@ except Exception:
 
 log = logging.getLogger("xml_redaction")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HWPX 처리용: 레닥션 전 스캔에서 모은 시크릿(문자열)들을 저장했다가 OLE 프리뷰에도 반영
+# ─────────────────────────────────────────────────────────────────────────────
 _CURRENT_SECRETS: List[str] = []
 
 
@@ -50,6 +53,9 @@ def set_hwpx_secrets(values: List[str] | None):
     _CURRENT_SECRETS = list(dict.fromkeys(v for v in (values or []) if v))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 텍스트 수집: 본문 XML, 차트 XML, 내장 XLSX(sharedStrings, worksheets, charts)
+# ─────────────────────────────────────────────────────────────────────────────
 def hwpx_text(zipf: zipfile.ZipFile) -> str:
     out: List[str] = []
 
@@ -108,7 +114,9 @@ def hwpx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(x for x in out if x))
 
 
-# /text/extract 용 텍스트 추출
+# ─────────────────────────────────────────────────────────────────────────────
+# /text/extract 용 텍스트 추출 (사람이 보기 좋게 정리)
+# ─────────────────────────────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         raw = hwpx_text(zipf)
@@ -120,13 +128,10 @@ def extract_text(file_bytes: bytes) -> dict:
     lines: List[str] = []
     for line in txt.splitlines():
         s = line.strip()
-        # 전체 라인이 각주 마커만 있으면 버림
         if re.fullmatch(r"\(?\^\d+[\).\s]*", s):
             continue
         lines.append(line)
     txt = "\n".join(lines)
-
-    # 라인 중간에 남은 "(^5)" 같은 패턴도 제거
     txt = re.sub(r"\(\^\d+\)", "", txt)
 
     # 3) 엑셀 시트/범위 토큰 제거
@@ -151,10 +156,29 @@ def extract_text(file_bytes: bytes) -> dict:
     }
 
 
-# 스캔: 정규식 규칙으로 추출
+# ─────────────────────────────────────────────────────────────────────────────
+# 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보를 추출
+# ─────────────────────────────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = hwpx_text(zipf)
     comp = compile_rules()
+
+    # RULES에서 validator 가져오기 (없으면 None → 항상 True로 간주)
+    try:
+        from ..core.redaction_rules import RULES
+    except Exception:
+        try:
+            from ..redaction_rules import RULES
+        except Exception:
+            from server.core.redaction_rules import RULES
+
+    def _get_validator(rule_name: str):
+        v = None
+        try:
+            v = RULES.get(rule_name, {}).get("validator")
+        except Exception:
+            v = None
+        return v if callable(v) else None
 
     out: List[XmlMatch] = []
 
@@ -163,22 +187,35 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
             if isinstance(ent, (list, tuple)):
                 rule_name = ent[0]
                 rx = ent[1]
+                need_valid = bool(ent[2]) if len(ent) >= 3 else True
             else:
                 rule_name = getattr(ent, "name", getattr(ent, "rule", "unknown"))
                 rx = getattr(ent, "rx", getattr(ent, "regex", None))
+                need_valid = bool(getattr(ent, "need_valid", True))
             if rx is None:
                 continue
         except Exception:
             continue
 
+        validator = _get_validator(rule_name)
+
         for m in rx.finditer(text):
             val = m.group(0)
+            ok = True
+            if need_valid and validator:
+                try:
+                    try:
+                        ok = bool(validator(val))
+                    except TypeError:
+                        ok = bool(validator(val, None))
+                except Exception:
+                    ok = False  # 검증 예외는 실패로 간주
 
             out.append(
                 XmlMatch(
                     rule=rule_name,
                     value=val,
-                    valid=True,  # HWPX에서는 패턴에만 걸려도 모두 valid 로 본다
+                    valid=ok,
                     context=text[max(0, m.start() - 20): min(len(text), m.end() + 20)],
                     location=XmlLocation(
                         kind="hwpx",
@@ -189,10 +226,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
                 )
             )
 
-    # 두 번째 리턴값 "hwpx"는 기존 호출부와의 호환용 태그
     return out, "hwpx", text
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 파일 단위 레닥션
+# ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
     low = filename.lower()
 
@@ -250,6 +289,4 @@ def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
     if low.endswith(".xml") and not low.startswith("preview/"):
         masked, _ = sub_text_nodes(data, comp)
         return masked
-
-    # 7) 그 외 파트는 원본 유지
     return None

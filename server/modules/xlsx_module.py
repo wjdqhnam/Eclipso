@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, zipfile
+import io, zipfile, re
 from typing import List, Tuple
 
 # common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback 
@@ -42,8 +42,98 @@ except Exception:
         from server.core.redaction_rules import RULES  # type: ignore
 
 
+# ────────────────────────────────────────────────────
+# XLSX 텍스트 추출
+# ────────────────────────────────────────────────────
 def xlsx_text(zipf: zipfile.ZipFile) -> str:
-    return xlsx_text_from_zip(zipf)
+    out: List[str] = []
+
+    # 1) 공유 문자열 (대부분의 일반 텍스트 셀)
+    try:
+        sst = zipf.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
+        out += [
+            m.group(1)
+            for m in re.finditer(r"<t[^>]*>(.*?)</t>", sst, re.DOTALL)
+            if (m.group(1) or "").strip()
+        ]
+    except KeyError:
+        pass
+
+    # 2) 워크시트: 셀 값(<v>) + 인라인 텍스트(<t>)
+    for name in (
+        n for n in zipf.namelist()
+        if n.startswith("xl/worksheets/") and n.endswith(".xml")
+    ):
+        try:
+            xml = zipf.read(name).decode("utf-8", "ignore")
+        except KeyError:
+            continue
+
+        # 2-1) 셀 값(<v>): 순수 숫자 1~4자리는 축값/잡음으로 보고 스킵
+        for m in re.finditer(r"<v[^>]*>(.*?)</v>", xml, re.DOTALL):
+            v = (m.group(1) or "").strip()
+            if not v:
+                continue
+            # 예: 4, 13, 52, 5555, 0, 1, 2, 3 ...
+            if re.fullmatch(r"\d{1,4}", v):
+                continue
+            out.append(v)
+
+        # 2-2) 인라인 텍스트(<t>)는 그대로 추가
+        out += [
+            m.group(1)
+            for m in re.finditer(r"<t[^>]*>(.*?)</t>", xml, re.DOTALL)
+            if (m.group(1) or "").strip()
+        ]
+
+    # 3) 차트: 라벨(<a:t>) + 값(<c:v>)
+    for name in (
+        n for n in zipf.namelist()
+        if n.startswith("xl/charts/") and n.endswith(".xml")
+    ):
+        try:
+            s2 = zipf.read(name).decode("utf-8", "ignore")
+        except KeyError:
+            continue
+
+        for m in re.finditer(
+            r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>",
+            s2,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            text_part = m.group(1)
+            num_part = m.group(2)
+            v = (text_part or num_part or "").strip()
+            if not v:
+                continue
+
+            # <c:v>에서 온 순수 숫자 1~4자리 → 차트 축/샘플 숫자로 보고 스킵
+            if num_part is not None and re.fullmatch(r"\d{1,4}", v):
+                continue
+
+            out.append(v)
+
+    # 4) 최종 문자열 정리
+    text = cleanup_text("\n".join(out))
+
+    # 5) 라인 단위 후처리:
+    #    - <c:...>가 들어간 차트 XML 줄 제거
+    #    - 끝이 ':'이고 숫자/ @ 가 없는 라벨 줄 제거 (카드:, / 이메일:, 유니코드 대시 카드: 등)
+    filtered_lines: List[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # 차트 XML 태그
+        if "<c:" in s:
+            continue
+        # 라벨만 있는 줄 (예: "카드:", "/ 이메일:", "유니코드 대시 카드:")
+        if s.endswith(":") and not re.search(r"[0-9@]", s):
+            continue
+
+        filtered_lines.append(line)
+
+    return "\n".join(filtered_lines)
 
 
 # /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
@@ -115,7 +205,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
                     value=val,
                     valid=ok,
                     context=text[max(0, m.start() - 20): min(len(text), m.end() + 20)],
-                    location=XmlLocation(kind="xlsx", part="*merged_text*", start=m.start(), end=m.end()),
+                    location=XmlLocation(
+                        kind="xlsx",
+                        part="*merged_text*",
+                        start=m.start(),
+                        end=m.end(),
+                    ),
                 )
             )
 

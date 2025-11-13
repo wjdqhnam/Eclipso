@@ -18,12 +18,6 @@ router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
 
 
-# --- match_text 전용 validator 래퍼 -----------------------------
-# 정규식 매칭 결과에서 validator가 붙은 룰의 유효/무효를 판단할 때 사용한다.
-# - validator가 callable이 아니면 항상 True
-# - (value) 또는 (value, opts) 시그니처 모두 지원
-# - 예외가 나면 False로 간주해서 "FAIL"로 처리
-
 def _run_validator(value: str, validator) -> bool:
     if not callable(validator):
         return True
@@ -52,10 +46,6 @@ def _read_pdf(file: UploadFile) -> bytes:
 
 
 def _load_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    """
-    클라이언트에서 넘어온 JSON 문자열을 PatternItem 리스트로 변환한다.
-    - patterns_json: JSON 문자열 (리스트 또는 {'patterns': [...]} 형태)
-    """
     if not patterns_json:
         # 없는 경우 기본 PRESET_PATTERNS 사용
         return [PatternItem(**p) for p in PRESET_PATTERNS]
@@ -88,35 +78,6 @@ def _load_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
         raise HTTPException(status_code=400, detail=f"잘못된 PatternItem 형식: {e}")
 
 
-def _compile_dynamic_patterns(patterns: List[PatternItem]) -> List[types.SimpleNamespace]:
-    """
-    PatternItem 리스트를 받아서, 정규식을 컴파일한 네임스페이스 리스트로 변환.
-    (PDF 박스 탐지에서 사용)
-    """
-    compiled: List[types.SimpleNamespace] = []
-    for it in patterns:
-        regex = getattr(it, "regex", None)
-        if not regex:
-            raise HTTPException(
-                status_code=400, detail="PatternItem에 'regex' 누락"
-            )
-
-        try:
-            rp = re.compile(regex)
-        except re.error as e:
-            name_for_msg = getattr(it, "name", getattr(it, "label", "UNKNOWN"))
-            raise HTTPException(
-                status_code=400,
-                detail=f"정규식 컴파일 실패({name_for_msg}): {e}",
-            )
-
-        # 네임스페이스로 래핑(+ compiled)
-        ns = types.SimpleNamespace(**it.dict())
-        setattr(ns, "compiled", rp)
-        compiled.append(ns)
-    return compiled
-
-
 @router.post(
     "/redactions/detect",
     response_model=DetectResponse,
@@ -133,9 +94,6 @@ async def detect(
         description="커스텀 패턴 정의(JSON 문자열, 생략 시 PRESET_PATTERNS 사용)",
     ),
 ):
-    """
-    PDF에서 기본/커스텀 패턴에 해당하는 텍스트 박스를 찾는다.
-    """
     _ensure_pdf(file)
     pdf_bytes = _read_pdf(file)
 
@@ -178,16 +136,6 @@ async def apply(
 
 
 def match_text(text: str):
-    """텍스트 전체에 대해 정규식 매칭을 수행하고,
-    validator 기준으로 OK/FAIL을 나눠서 반환한다.
-
-    ※ 기존 버전과의 차이점
-    - 예전에는 validator에서 FAIL 난 매치는 아예 results에서 제외했기 때문에
-      UI에서는 "OK만 있는 것처럼" 보였다.
-    - 이제는 정규식에 한 번이라도 걸리면 모두 items에 포함시키고,
-      validator 결과에 따라 `valid=True/False`로 표기해서
-      화면에서 FAIL 개수와 목록을 확인할 수 있게 한다.
-    """
     try:
         if not isinstance(text, str):
             text = str(text)

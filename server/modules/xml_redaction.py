@@ -59,30 +59,6 @@ def detect_xml_type(filename: str) -> str:
     if l.endswith(".hwpx"): return "hwpx"
     raise HTTPException(400, f"Unsupported XML type for: {filename}")
 
-# 스캔
-def xml_scan(file_bytes: bytes, filename: str) -> XmlScanResponse:
-    text_limit = int(os.getenv("XML_SCAN_TEXT_LIMIT", "20000"))
-    with io.BytesIO(file_bytes) as bio, zipfile.ZipFile(bio, "r") as zipf:
-        kind = detect_xml_type(filename)
-        if kind == "xlsx":
-            matches, k, text = xlsx.scan(zipf)
-        elif kind == "pptx":
-            matches, k, text = pptx.scan(zipf)
-        elif kind == "hwpx":
-            matches, k, text = hwpx.scan(zipf)
-        elif kind == "docx":
-            matches, k, text = docx.scan(zipf)
-        else:
-            raise HTTPException(400, f"Unknown kind: {kind}")
-
-        if text and len(text) > text_limit:
-            text = text[:text_limit] + "\n… (truncated)"
-        return XmlScanResponse(
-            file_type=k,
-            total_matches=len(matches),
-            matches=matches,
-            extracted_text=text or "",
-        )
 
 # HWPX: 시크릿 수집(사전 스캔)
 def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:

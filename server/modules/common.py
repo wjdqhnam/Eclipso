@@ -221,7 +221,7 @@ def chart_rels_sanitize(rels_bytes: bytes) -> Tuple[bytes, int]:
 
 
 def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
-    """차트 XML도 동일 정책으로 텍스트만 마스킹."""
+#차트 XML도 동일 정책으로 텍스트만 마스킹.
     return sub_text_nodes(xml_bytes, comp)
 
 #DOCX [Content_Types].xml 보정(스텁) 
