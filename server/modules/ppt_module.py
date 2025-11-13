@@ -6,36 +6,33 @@ import unicodedata
 
 import unicodedata
 
-_ZW_CHARS = r"\u200B\u200C\u200D\uFEFF"  # ZWSP/ZWNJ/ZWJ/BOM
+_ZW_CHARS = r"\u200B\u200C\u200D\uFEFF"
 def _norm_line(t: str) -> str:
-    # 1) NFKC 정규화로 호환 문자/조합 통일
     t = unicodedata.normalize("NFKC", t or "")
-    # 2) 제로폭류 제거(공백으로 안 잡힘)
     t = re.sub(f"[{_ZW_CHARS}]", "", t)
-    # 3) NBSP/얇은 공백/전각공백 포함 모든 공백 → 단일 스페이스
     t = re.sub(r"[\s\u00A0\u202F\u3000]+", " ", t).strip()
     return t
 
 _RE_MASTER_LEVEL = re.compile(
-    r"^(?:[•·\*\-\–\—◦●○◆◇▪▫▶▷■□·]+\s*)?"        # (있을 수도 있는 불릿)
+    r"^(?:[•·\*\-\–\—◦●○◆◇▪▫▶▷■□·]+\s*)?"
     r"(?:첫|둘|셋|넷|다섯|여섯|일곱|여덟|아홉|열|[0-9]+)\s*(?:번째)?\s*수준\s*$",
     re.IGNORECASE
 )
 
 
-# --- 외부 의존 ---
+# 외부 의존
 try:
-    import olefile  # type: ignore
+    import olefile  
 except Exception:
-    olefile = None  # type: ignore
+    olefile = None  
 
 if TYPE_CHECKING:
-    from olefile import OleFileIO as _OleFileIO  # pragma: no cover
-    OleFileIO = _OleFileIO  # pragma: no cover
+    from olefile import OleFileIO as _OleFileIO
+    OleFileIO = _OleFileIO 
 else:
     OleFileIO = Any
 
-# --- 규칙/검증기 로더(옵션) ---
+# 규칙/검증기 로더(옵션)
 _RULES: Optional[dict] = None
 _VALIDATORS: Optional[dict] = None
 
@@ -47,13 +44,13 @@ def _try_load_rules_and_validators() -> None:
         ("redaction_rules", "RULES"),
     ]:
         try:
-            m = __import__(mod, fromlist=[name])  # type: ignore
+            m = __import__(mod, fromlist=[name]) 
             _RULES = getattr(m, name, None) or _RULES
         except Exception:
             pass
     for mod in ["server.modules.validators","server.core.validators","validators"]:
         try:
-            m = __import__(mod, fromlist=["*"])  # type: ignore
+            m = __import__(mod, fromlist=["*"])  
             _VALIDATORS = _VALIDATORS or {}
             for key in (
                 "is_valid_rrn","is_valid_fgn","is_valid_phone_mobile","is_valid_phone_city",
@@ -67,15 +64,13 @@ def _try_load_rules_and_validators() -> None:
 
 _try_load_rules_and_validators()
 
-# 옵션
+
 PPT_EXTRACT_EMBEDDED = False
-PPT_CLEANUP_STRICT = False  # True면 강한 노이즈 컷, False면 최대한 보존
+PPT_CLEANUP_STRICT = False
 
-# --------- 내부 유틸 ---------
-
-_HDR = struct.Struct("<HHI")  # (verInst, recType, recLen)
-_TEXTCHARSATOM = 0x0FA0  # Unicode text atom in PPT (RT_TextCharsAtom)
-_TEXTBYTESATOM = 0x0FA8  # 8-bit text atom (RT_TextBytesAtom)
+_HDR = struct.Struct("<HHI")
+_TEXTCHARSATOM = 0x0FA0  
+_TEXTBYTESATOM = 0x0FA8 
 
 _LINE_NOISE = re.compile(
     r"마스터\s*(?:제목|텍스트)\s*스타일.*"
@@ -96,23 +91,23 @@ def _cleanup(s: str) -> str:
         if not raw.strip():
             continue
 
-        n = _norm_line(raw)      # ← 정규화
+        n = _norm_line(raw)
         if not n:
             continue
 
-        # 3-1) ‘수준’ 플레이스홀더 컷 (두/세/네/다섯/숫자 모든 변종 대응)
+        # ‘수준’ 플레이스홀더 컷 (두/세/네/다섯/숫자 모든 변종 대응)
         if _RE_MASTER_LEVEL.match(n):
             continue
 
-        # 3-2) 기존 노이즈(마스터 문구/차트·폰트 등)
+        # 기존 노이즈(마스터 문구/차트·폰트 등)
         if _LINE_NOISE.search(n):
             continue
 
-        # 3-3) 불릿만 있는 줄 컷
+        # 불릿만 있는 줄 컷
         if re.fullmatch(r"[\s•·\*\-\–\—◦●○◆◇▪▫▶▷■□·]+", n):
             continue
 
-        # 3-4) 가독성 휴리스틱(과하면 낮추세요)
+        # 가독성 휴리스틱(과하면 낮추세요)
         letters = sum(ch.isalnum() or ch.isspace() for ch in n)
         if letters / max(1, len(n)) < 0.2:
             continue
@@ -139,9 +134,11 @@ def _walk_records(buf: bytes, base_off: int = 0) -> Iterable[Tuple[int,int,int,i
             yield (rec_ver, rtype, rlen, data_off_abs)
         i = i_data_end
 
+
 def _read_powerpoint_document(ole: OleFileIO) -> bytes:
     with ole.openstream("PowerPoint Document") as fp:  # type: ignore[attr-defined]
         return fp.read()
+
 
 def _extract_text_from_records(doc_bytes: bytes) -> str:
     chunks: List[str] = []
@@ -164,14 +161,15 @@ def _extract_text_from_records(doc_bytes: bytes) -> str:
             continue
     return _cleanup("\n".join(chunks))
 
+
 def _extract_embedded_noise_prone(ole: OleFileIO) -> str:
     out = []
-    for entry in ole.listdir(streams=True, storages=False):  # type: ignore[attr-defined]
+    for entry in ole.listdir(streams=True, storages=False):
         path = "/".join(entry)
         if not any(key in path for key in ("embeddings", "ObjectPool", "Ole10Native", "Package")):
             continue
         try:
-            with ole.openstream(entry) as fp:  # type: ignore[attr-defined]
+            with ole.openstream(entry) as fp:
                 blob = fp.read()
             for enc in ("utf-16le", "utf-8", "cp949", "latin1"):
                 try:
@@ -183,8 +181,8 @@ def _extract_embedded_noise_prone(ole: OleFileIO) -> str:
             continue
     return _cleanup("\n".join(out))
 
-# --- 규칙 기반 시크릿 탐지(동일 길이 마스킹용) ---
 
+# 규칙 기반 시크릿 탐지(동일 길이 마스킹용)
 def _iter_rule_matches(text: str):
     if not _RULES:
         return []
@@ -216,6 +214,7 @@ def _iter_rule_matches(text: str):
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
     return merged
 
+
 def _mask_same_len(text: str, spans):
     if not spans:
         return text
@@ -230,16 +229,12 @@ def _mask_same_len(text: str, spans):
         out.append(text[cur:])
     return "".join(out)
 
-# --------- 공개 API ---------
 
+# 공개 API
 def extract_text(file_bytes: bytes):
-    """
-    API 호환: dict 반환
-    {"full_text": str, "pages": [{"index": 1, "text": str}]}
-    """
     if olefile is None:
         raise RuntimeError("olefile 모듈이 필요합니다. pip install olefile")
-    with olefile.OleFileIO(BytesIO(file_bytes)) as ole:  # type: ignore
+    with olefile.OleFileIO(BytesIO(file_bytes)) as ole:
         doc = _read_powerpoint_document(ole)
         text_main = _extract_text_from_records(doc)
         if PPT_EXTRACT_EMBEDDED:
@@ -247,20 +242,19 @@ def extract_text(file_bytes: bytes):
             if text_emb:
                 text_main = _cleanup(text_main + "\n" + text_emb)
 
-    # 빈 문자열 방지: 최소한의 가시성 확보
     pages = [{"index": 1, "text": text_main or ""}]
     return {"full_text": text_main or "", "pages": pages}
 
 def redact(file_bytes: bytes) -> bytes:
     try:
-        from .ole_redactor import redact_ole_bin_preserve_size  # type: ignore
+        from .ole_redactor import redact_ole_bin_preserve_size  
     except Exception:
         try:
-            from ole_redactor import redact_ole_bin_preserve_size  # type: ignore
+            from ole_redactor import redact_ole_bin_preserve_size 
         except Exception:
-            redact_ole_bin_preserve_size = None  # type: ignore
+            redact_ole_bin_preserve_size = None 
 
-    if redact_ole_bin_preserve_size is None:  # type: ignore
+    if redact_ole_bin_preserve_size is None: 
         return file_bytes
 
     try:
@@ -272,7 +266,7 @@ def redact(file_bytes: bytes) -> bytes:
     if text:
         spans = list(_iter_rule_matches(text)) if _RULES else []
         if spans:
-            _ = _mask_same_len(text, spans)  # 미리보기용 계산(미사용)
+            _ = _mask_same_len(text, spans)
             for s, e in spans:
                 seg = text[s:e].strip()
                 if len(seg) >= 2:
@@ -288,6 +282,6 @@ def redact(file_bytes: bytes) -> bytes:
         return file_bytes
 
     try:
-        return redact_ole_bin_preserve_size(file_bytes, secrets, mask_preview=False)  # type: ignore
+        return redact_ole_bin_preserve_size(file_bytes, secrets, mask_preview=False)
     except Exception:
         return file_bytes
