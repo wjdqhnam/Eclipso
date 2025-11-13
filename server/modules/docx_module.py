@@ -41,8 +41,6 @@ except Exception:
 
 # ─────────────────────
 # 차트/임베디드 XLSX 텍스트 수집 (차트 전용 필터만 적용)
-#   - 숫자 시리즈(정수/소수), <c:...> 태그 줄, "항목 N"/"계열 N" 제거
-#   - 본문(document.xml)에서 이미 나온 줄과의 중복만 제거
 # ─────────────────────
 def _collect_chart_texts(zipf: zipfile.ZipFile, main_seen: set[str]) -> str:
     parts: List[str] = []
