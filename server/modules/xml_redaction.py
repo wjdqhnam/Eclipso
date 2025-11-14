@@ -9,49 +9,50 @@ import tempfile
 import subprocess
 from typing import List, Optional
 
-import fitz 
+import fitz
 from fastapi import HTTPException
 
-# XmlScanResponse 임포트
+# XmlScanResponse 임포트 (core 우선, 실패 시 대안 경로)
 try:
-    from ..core.schemas import XmlScanResponse  #
+    from ..core.schemas import XmlScanResponse
 except Exception:
     try:
-        from ..schemas import XmlScanResponse   
+        from ..schemas import XmlScanResponse
     except Exception:
         from server.core.schemas import XmlScanResponse
 
-# 같은 패키지(server.modules) 내부 모듈 임포트
+# 모듈 임포트 (상대 경로 우선)
 try:
     from . import docx_module as docx
-except Exception:  # pragma: no cover
-    from server.modules import docx_module as docx  # type: ignore
+except Exception:
+    from server.modules import docx_module as docx
 
 try:
     from . import xlsx_module as xlsx
-except Exception:  # pragma: no cover
-    from server.modules import xlsx_module as xlsx  # type: ignore
+except Exception:
+    from server.modules import xlsx_module as xlsx
 
 try:
     from . import pptx_module as pptx
-except Exception:  # pragma: no cover
-    from server.modules import pptx_module as pptx  # type: ignore
+except Exception:
+    from server.modules import pptx_module as pptx
 
 try:
     from . import hwpx_module as hwpx
-except Exception:  # pragma: no cover
-    from server.modules import hwpx_module as hwpx  # type: ignore
+except Exception:
+    from server.modules import hwpx_module as hwpx
 
-# compile_rules 유틸 임포트
+# 규칙 컴파일러
 try:
     from .common import compile_rules
-except Exception:  # pragma: no cover
-    from server.modules.common import compile_rules  # type: ignore
+except Exception:
+    from server.modules.common import compile_rules
 
 log = logging.getLogger("xml_redaction")
 
-# 타입 판별
+
 def detect_xml_type(filename: str) -> str:
+    # 확장자로 포맷 판별
     l = (filename or "").lower()
     if l.endswith(".docx"): return "docx"
     if l.endswith(".xlsx"): return "xlsx"
@@ -60,8 +61,8 @@ def detect_xml_type(filename: str) -> str:
     raise HTTPException(400, f"Unsupported XML type for: {filename}")
 
 
-# HWPX: 시크릿 수집(사전 스캔)
 def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:
+    # HWPX에서 사전 매칭으로 마스킹 키워드 수집
     text = hwpx.hwpx_text(zin)
     comp = compile_rules()
     secrets: List[str] = []
@@ -70,10 +71,12 @@ def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:
         for m in rx.finditer(text or ""):
             v = m.group(0)
             if v and v not in seen:
-                seen.add(v); secrets.append(v)
+                seen.add(v)
+                secrets.append(v)
     return secrets
 
-# 프리뷰 재생성 유틸(soffice → PDF → PNG)
+
+# LibreOffice 실행 파일 탐색
 def _find_soffice() -> Optional[str]:
     candidates = [
         shutil.which("soffice"),
@@ -87,7 +90,9 @@ def _find_soffice() -> Optional[str]:
             return p
     return None
 
+
 def _office_to_pdf_with_soffice(in_path: str, out_dir: str) -> str:
+    # 문서를 PDF로 변환
     soffice = _find_soffice()
     if not soffice:
         raise RuntimeError("LibreOffice(soffice) 실행 파일을 찾지 못했습니다.")
@@ -112,7 +117,9 @@ def _office_to_pdf_with_soffice(in_path: str, out_dir: str) -> str:
         pdf_path = cands[0]
     return pdf_path
 
+
 def _render_pdf_to_png_bytes(pdf_path: str, dpi: int = 144) -> List[bytes]:
+    # PDF → PNG 바이트 목록
     images: List[bytes] = []
     doc = fitz.open(pdf_path)
     try:
@@ -126,7 +133,9 @@ def _render_pdf_to_png_bytes(pdf_path: str, dpi: int = 144) -> List[bytes]:
     log.info("HWPX preview regen: rendered %d page(s) at %ddpi", len(images), dpi)
     return images
 
+
 def _list_preview_names(zipf: zipfile.ZipFile) -> List[str]:
+    # ZIP 내 프리뷰 이미지 경로 수집
     names = []
     for n in zipf.namelist():
         nl = n.lower()
@@ -135,12 +144,14 @@ def _list_preview_names(zipf: zipfile.ZipFile) -> List[str]:
     names.sort()
     return names
 
+
 def _rewrite_zip_replacing_previews(
     redacted_tmp_hwpx: str,
     dst_path: str,
     new_images: List[bytes],
     original_preview_names: List[str],
 ) -> None:
+    # 프리뷰 이미지만 새 이미지로 교체
     with zipfile.ZipFile(redacted_tmp_hwpx, "r") as zin, \
          zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED) as zout:
 
@@ -179,8 +190,9 @@ def _rewrite_zip_replacing_previews(
         os.path.basename(dst_path),
     )
 
-# 레닥션(파일→파일)
+
 def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
+    # XML 포맷 레닥션 → 파일 저장
     comp = compile_rules()
     kind = detect_xml_type(filename)
     log.info("XML redact: file=%s kind=%s", filename, kind)
@@ -199,6 +211,7 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp_redacted = os.path.join(td, os.path.splitext(os.path.basename(dst_path))[0] + ".tmp.hwpx")
 
+        # ZIP 항목 순회하며 파트별 레닥션
         with zipfile.ZipFile(src_path, "r") as zin, zipfile.ZipFile(tmp_redacted, "w", zipfile.ZIP_DEFLATED) as zout:
             if kind == "hwpx" and "mimetype" in zin.namelist():
                 zi = zipfile.ZipInfo("mimetype")
@@ -212,7 +225,7 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
                 if red is None:
                     zout.writestr(item, data); kept += 1
                 elif isinstance(red, (bytes, bytearray)) and len(red) == 0:
-                    dropped += 1  # skip
+                    dropped += 1
                 else:
                     zout.writestr(item, red); modified += 1
 
@@ -233,6 +246,7 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
 
             log.info("%s ZIP result: kept=%d modified=%d dropped=%d", kind.upper(), kept, modified, dropped)
 
+        # 프리뷰 재생성 옵션
         regen = (os.getenv("HWPX_REGEN_PREVIEW", "0") in ("1", "true", "TRUE"))
         if kind == "hwpx" and regen:
             log.info("HWPX preview regen: start (env HWPX_REGEN_PREVIEW=1)")
