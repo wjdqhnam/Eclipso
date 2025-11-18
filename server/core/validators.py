@@ -13,6 +13,18 @@ def is_valid_date6(digits: str) -> bool:
     except ValueError:
         return False
 
+# 주민등록번호 발급연도 계산
+def _full_year_from_rrn(d13: str) -> int:
+    s = d13[6]; yy = int(d13[:2])
+    this_yy = int(str(datetime.today().year)[-2:])
+    if s in "12":  # 1900~
+        return 1900 + yy
+    if s in "34":  # 2000~
+        return 2000 + yy
+    if s in "09":  # 1800~ (예외)
+        return 1800 + yy
+    return (1900 + yy) if yy > this_yy else (2000 + yy)
+
 # 주민등록번호 (내국인)
 def is_valid_rrn(rrn: str, opts: dict | None = None) -> bool:
     d = _digits(rrn)
@@ -20,7 +32,16 @@ def is_valid_rrn(rrn: str, opts: dict | None = None) -> bool:
         return False
     if not is_valid_date6(d[:6]):
         return False
+
     use_checksum = (opts or {}).get("rrn_checksum", True)
+
+    try:
+        full_year = _full_year_from_rrn(d)
+        if full_year >= 2020:
+            use_checksum = False
+    except Exception:
+        pass  # 계산 실패 시 기존 로직 유지
+
     if use_checksum and not is_valid_rrn_checksum(d):
         return False
     return True
@@ -36,6 +57,7 @@ def is_valid_fgn_checksum(fgn: str) -> bool:
     chk = (chk + 2) % 10
     return chk == int(d[-1])
 
+# 외국인등록번호
 def is_valid_fgn(fgn: str, opts: dict | None = None) -> bool:
     d = _digits(fgn)
     if len(d) != 13:

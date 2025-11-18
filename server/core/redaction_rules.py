@@ -23,10 +23,19 @@ def apply_redaction_rules(text: str, rules: dict = None, mask: str = "***") -> s
     return new_text
 
 # 주민등록번호
-RRN_RE = re.compile(r"\d{6}-\d{7}")
-
+RRN_RE = re.compile(
+    r"\b"           # 앞뒤 경계
+    r"\d{6}-"       # 생년월일 6자리
+    r"[0-490]\d{6}" # 7번째 자리: 1,2,3,4,9,0 / 나머지 6자리 숫자
+    r"\b"
+)
 # 외국인등록번호
-FGN_RE = re.compile(r"\d{6}-\d{7}")
+FGN_RE = re.compile(
+    r"\b"
+    r"\d{6}-"
+    r"[5-8]\d{6}"
+    r"\b"
+)
 
 # 카드번호
 CARD_RE = re.compile(r"(?:\d[ -]?){15,16}")
@@ -92,6 +101,7 @@ RULES = {
 # --- 사전 정의된 패턴 ---
 PRESET_PATTERNS = [
     {"name": "rrn",            "regex": RRN_RE.pattern,        "case_sensitive": False, "whole_word": False},
+    {"name": "fgn",            "regex": FGN_RE.pattern,        "case_sensitive": False, "whole_word": False},  # ★ 추가
     {"name": "email",          "regex": EMAIL_RE.pattern,      "case_sensitive": False, "whole_word": False},
     {"name": "phone_mobile",   "regex": MOBILE_RE.pattern,     "case_sensitive": False, "whole_word": False},
     {"name": "phone_city",     "regex": CITY_RE.pattern,       "case_sensitive": False, "whole_word": False},
