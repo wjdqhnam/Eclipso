@@ -1,25 +1,17 @@
 # server/modules/pdf_module.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import io
 import re
 from typing import List, Optional, Set, Dict
 
-import fitz  # PyMuPDF
+import fitz
+import numpy as np
 
 from server.core.schemas import Box, PatternItem
-from server.core.redaction_rules import PRESET_PATTERNS, RULES
-from server.modules.ner_module import run_ner  # 앞으로 쓸 수도 있으니 그대로 둠
-from server.core.merge_policy import MergePolicy, DEFAULT_POLICY
-from server.core.regex_utils import match_text
-
-# 공통 유틸: 텍스트 정리 + 규칙 컴파일(validator 포함)
-try:
-    from .common import cleanup_text, compile_rules
-except Exception:  # pragma: no cover
-    from server.modules.common import cleanup_text, compile_rules  # type: ignore
-
+from server.core.redaction_rules import PRESET_PATTERNS
+from .common import cleanup_text, compile_rules
+from .ocr_module import run_paddle_ocr, OcrItem
 
 log_prefix = "[PDF]"
 
@@ -28,17 +20,6 @@ log_prefix = "[PDF]"
 # /text/extract 용 텍스트 추출
 # ─────────────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
-    """
-    PDF에서 텍스트를 추출해 /text/extract 형식으로 반환.
-
-    {
-      "full_text": "...",
-      "pages": [
-        {"page": 1, "text": "..."},
-        ...
-      ]
-    }
-    """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
         pages = []
@@ -67,11 +48,6 @@ def extract_text(file_bytes: bytes) -> dict:
 def _normalize_pattern_names(
     patterns: List[PatternItem] | None,
 ) -> Optional[Set[str]]:
-    """
-    /redactions/pdf/scan 에서 넘어온 patterns 는 PRESET 기반이므로
-    이름만 추려서 서버쪽 compile_rules 결과를 필터링하는 데만 쓴다.
-    (regex 문자열은 서버 PRESET 과 동일하다고 가정하고 무시)
-    """
     if not patterns:
         return None
 
@@ -84,41 +60,159 @@ def _normalize_pattern_names(
 
 
 def _is_valid_value(need_valid: bool, validator, value: str) -> bool:
-    """
-    compile_rules() 가 넘겨준 need_valid / validator 를 그대로 사용.
-    - need_valid == False → validator 무시, 항상 OK
-    - need_valid == True  → validator 가 있으면 돌려서 True 일 때만 OK
-    """
     if not need_valid or not callable(validator):
         return True
     try:
         try:
             return bool(validator(value))
         except TypeError:
-            # validator(val, ctx) 형태일 수도 있음
             return bool(validator(value, None))
     except Exception:
-        # validator 내부 예외는 FAIL 처리
         print(f"{log_prefix} VALIDATOR ERROR", repr(value))
         return False
 
 
+def _merge_card_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
+    if len(rects) <= 1:
+        return rects
+
+    rects_sorted = sorted(rects, key=lambda r: (r.y0, r.x0))
+
+    line_clusters: List[List[fitz.Rect]] = []
+    current_cluster: List[fitz.Rect] = [rects_sorted[0]]
+
+    Y_TOL = 2.0
+
+    for r in rects_sorted[1:]:
+        last = current_cluster[-1]
+        if abs(r.y0 - last.y0) <= Y_TOL:
+            current_cluster.append(r)
+        else:
+            line_clusters.append(current_cluster)
+            current_cluster = [r]
+    line_clusters.append(current_cluster)
+
+    merged: List[fitz.Rect] = []
+
+    for cluster in line_clusters:
+        if len(cluster) == 1:
+            merged.append(cluster[0])
+        else:
+            x0 = min(r.x0 for r in cluster)
+            y0 = min(r.y0 for r in cluster)
+            x1 = max(r.x1 for r in cluster)
+            y1 = max(r.y1 for r in cluster)
+            merged.append(fitz.Rect(x0, y0, x1, y1))
+
+    return merged
+
+
+# ─────────────────────────────────────────────────────────────
+# 이미지/OCR 헬퍼
+# ─────────────────────────────────────────────────────────────
+def _page_to_image_rgb(page: fitz.Page, zoom: float = 2.0) -> tuple[np.ndarray, float, float]:
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img_w, img_h = pix.width, pix.height
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(img_h, img_w, 3)
+    return img, float(img_w), float(img_h)
+
+
+def ocr_boxes_for_page(
+    doc: fitz.Document,
+    page_index: int,
+    patterns: List[PatternItem] | None = None,
+    min_score: float = 0.5,
+) -> List[Box]:
+    page = doc.load_page(page_index)
+    page_rect = page.rect
+    page_w, page_h = page_rect.width, page_rect.height
+
+    img, img_w, img_h = _page_to_image_rgb(page)
+    print(f"{log_prefix} [OCR] page={page_index + 1} image={img_w}x{img_h}")
+    ocr_items: List[OcrItem] = run_paddle_ocr(img, min_score=min_score)
+    print(f"{log_prefix} [OCR] page={page_index + 1} ocr_items={len(ocr_items)}")
+
+    comp = compile_rules()
+    allowed_names = _normalize_pattern_names(patterns)
+
+    boxes: List[Box] = []
+
+    for item in ocr_items:
+        print(f"{log_prefix} [OCR RAW] page={page_index + 1} text={repr(item.text)} score={item.score}")
+        text = cleanup_text(item.text)
+        if not text:
+            continue
+
+        matched = False
+
+        for (rule_name, rx, need_valid, _prio, validator) in comp:
+            if allowed_names and rule_name not in allowed_names:
+                continue
+
+            try:
+                it = rx.finditer(text)
+            except Exception:
+                continue
+
+            for m in it:
+                val = m.group(0)
+                if not val:
+                    continue
+
+                ok = _is_valid_value(need_valid, validator, val)
+                if not ok:
+                    continue
+
+                x0_img, y0_img, x1_img, y1_img = item.bbox
+
+                x0_pdf = x0_img / img_w * page_w
+                x1_pdf = x1_img / img_w * page_w
+                y0_pdf = y0_img / img_h * page_h
+                y1_pdf = y1_img / img_h * page_h
+
+                boxes.append(
+                    Box(
+                        page=page_index,
+                        x0=float(x0_pdf),
+                        y0=float(y0_pdf),
+                        x1=float(x1_pdf),
+                        y1=float(y1_pdf),
+                    )
+                )
+                matched = True
+
+        if (not matched) and (not allowed_names or "email" in allowed_names) and "@" in text:
+            x0_img, y0_img, x1_img, y1_img = item.bbox
+
+            x0_pdf = x0_img / img_w * page_w
+            x1_pdf = x1_img / img_w * page_w
+            y0_pdf = y0_img / img_h * page_h
+            y1_pdf = y1_img / img_h * page_h
+
+            boxes.append(
+                Box(
+                    page=page_index,
+                    x0=float(x0_pdf),
+                    y0=float(y0_pdf),
+                    x1=float(x1_pdf),
+                    y1=float(y1_pdf),
+                )
+            )
+
+    print(f"{log_prefix} [OCR] page={page_index + 1} boxes_from_ocr={len(boxes)}")
+    return boxes
+
+
 # ─────────────────────────────────────────────────────────────
 # PDF 내 박스 탐지
-#  - compile_rules() 기반 + validator 결과를 그대로 사용
-#  - FAIL(validator False) 인 값은 **절대로 박스 만들지 않음**
 # ─────────────────────────────────────────────────────────────
 def detect_boxes_from_patterns(
     pdf_bytes: bytes,
     patterns: List[PatternItem] | None,
+    use_ocr: bool = True,
 ) -> List[Box]:
-    """
-    patterns:
-      - None        → 서버 PRESET 전체 사용
-      - PatternItem → name 만 사용해서 subset 필터링
-    """
-    # 1) 서버 기준 규칙(validator 포함) 가져오기
-    comp = compile_rules()  # [(name, rx, need_valid, prio, validator), ...]
+    comp = compile_rules()
     allowed_names = _normalize_pattern_names(patterns)
 
     print(
@@ -126,8 +220,6 @@ def detect_boxes_from_patterns(
         "allowed_names=",
         sorted(allowed_names) if allowed_names else "ALL",
     )
-
-    # 룰별 OK/FAIL 카운터 (디버깅용)
     stats_ok: Dict[str, int] = {}
     stats_fail: Dict[str, int] = {}
 
@@ -135,8 +227,12 @@ def detect_boxes_from_patterns(
     boxes: List[Box] = []
 
     try:
-        for pno, page in enumerate(doc):
-            text = page.get_text("text") or ""
+        page_count = len(doc)
+        # --- 1) 기존 텍스트 기반 탐지 ---
+        for pno in range(page_count):
+            page = doc.load_page(pno)
+            raw_text = page.get_text("text") or ""
+            text = cleanup_text(raw_text)
             if not text:
                 continue
 
@@ -156,7 +252,6 @@ def detect_boxes_from_patterns(
 
                     ok = _is_valid_value(need_valid, validator, val)
 
-                    # 통계
                     if ok:
                         stats_ok[rule_name] = stats_ok.get(rule_name, 0) + 1
                     else:
@@ -170,13 +265,23 @@ def detect_boxes_from_patterns(
                         "ok=", ok,
                         "value=", repr(val),
                     )
-
-                    # FAIL 이면 박스 만들지 않음
                     if not ok:
                         continue
+                    rects = list(page.search_for(val))
+                    if not rects:
+                        continue
 
-                    # 실제 박스 찾기
-                    rects = page.search_for(val)
+                    if rule_name == "card" and "-" not in val and len(rects) > 1:
+                        rects = _merge_card_rects(rects)
+
+                    if ok and rule_name == "card":
+                        digits = re.sub(r"\D", "", val)
+                        if len(digits) >= 4:
+                            suffix = digits[-4:]
+                            extra_rects = list(page.search_for(suffix))
+                            for r in extra_rects:
+                                rects.append(r)
+
                     for r in rects:
                         print(
                             f"{log_prefix} BOX",
@@ -187,6 +292,19 @@ def detect_boxes_from_patterns(
                         boxes.append(
                             Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
                         )
+
+        # --- 2) OCR 기반 탐지 추가 ---
+        if use_ocr:
+            for pno in range(page_count):
+                ocr_bs = ocr_boxes_for_page(doc, pno, patterns)
+                for b in ocr_bs:
+                    print(
+                        f"{log_prefix}[OCR] BOX",
+                        "page=", pno + 1,
+                        "rect=", (b.x0, b.y0, b.x1, b.y1),
+                    )
+                boxes.extend(ocr_bs)
+
     finally:
         doc.close()
 
@@ -217,8 +335,6 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> 
             page = doc.load_page(int(b.page))
             rect = fitz.Rect(float(b.x0), float(b.y0), float(b.x1), float(b.y1))
             page.add_redact_annot(rect, fill=color)
-
-        # 페이지 단위로 실제 레닥션 적용
         for page in doc:
             page.apply_redactions()
 
@@ -230,19 +346,6 @@ def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> 
 
 
 def apply_text_redaction(pdf_bytes: bytes, extra_spans: list | None = None) -> bytes:
-    """
-    PRESET_PATTERNS 기반 텍스트 레닥션.
-
-    ※ 중요:
-      - 여기서는 **regex + validator 기반 박스만 사용**한다.
-      - extra_spans(NER / 기타 매칭 결과)는 PDF 레닥션에서는
-        FAIL/OK 구분이 확실하지 않아서 현재는 *레닥션에 사용하지 않는다*.
-        (필요하면 나중에 valid=True 인 것만 별도 하이라이트 용도로 쓸 수 있음)
-    """
-    # PRESET 전체를 PatternItem 형태로 만들어서 이름만 넘김
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
-
-    # extra_spans 는 지금 단계에서는 완전히 무시
-    # (FAIL 이라도 강제로 들어오는 걸 막기 위해)
     return apply_redaction(pdf_bytes, boxes)
