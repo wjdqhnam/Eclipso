@@ -111,9 +111,6 @@ def _merge_card_rects(rects: List[fitz.Rect]) -> List[fitz.Rect]:
 # 이미지/OCR 헬퍼
 # ─────────────────────────────────────────────────────────────
 def _page_to_image_rgb(page: fitz.Page, zoom: float = 2.0) -> tuple[np.ndarray, float, float]:
-    """
-    PDF 페이지를 RGB 이미지로 렌더링.
-    """
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img_w, img_h = pix.width, pix.height
@@ -127,9 +124,6 @@ def ocr_boxes_for_page(
     patterns: List[PatternItem] | None = None,
     min_score: float = 0.5,
 ) -> List[Box]:
-    """
-    단일 페이지를 OCR 돌려서 Box 리스트로 반환.
-    """
     page = doc.load_page(page_index)
     page_rect = page.rect
     page_w, page_h = page_rect.width, page_rect.height
@@ -149,6 +143,8 @@ def ocr_boxes_for_page(
         text = cleanup_text(item.text)
         if not text:
             continue
+
+        matched = False
 
         for (rule_name, rx, need_valid, _prio, validator) in comp:
             if allowed_names and rule_name not in allowed_names:
@@ -184,6 +180,25 @@ def ocr_boxes_for_page(
                         y1=float(y1_pdf),
                     )
                 )
+                matched = True
+
+        if (not matched) and (not allowed_names or "email" in allowed_names) and "@" in text:
+            x0_img, y0_img, x1_img, y1_img = item.bbox
+
+            x0_pdf = x0_img / img_w * page_w
+            x1_pdf = x1_img / img_w * page_w
+            y0_pdf = y0_img / img_h * page_h
+            y1_pdf = y1_img / img_h * page_h
+
+            boxes.append(
+                Box(
+                    page=page_index,
+                    x0=float(x0_pdf),
+                    y0=float(y0_pdf),
+                    x1=float(x1_pdf),
+                    y1=float(y1_pdf),
+                )
+            )
 
     print(f"{log_prefix} [OCR] page={page_index + 1} boxes_from_ocr={len(boxes)}")
     return boxes
@@ -258,6 +273,14 @@ def detect_boxes_from_patterns(
 
                     if rule_name == "card" and "-" not in val and len(rects) > 1:
                         rects = _merge_card_rects(rects)
+
+                    if ok and rule_name == "card":
+                        digits = re.sub(r"\D", "", val)
+                        if len(digits) >= 4:
+                            suffix = digits[-4:]
+                            extra_rects = list(page.search_for(suffix))
+                            for r in extra_rects:
+                                rects.append(r)
 
                     for r in rects:
                         print(
