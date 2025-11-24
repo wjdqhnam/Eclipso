@@ -1,4 +1,3 @@
-# server/modules/pdf_module.py
 from __future__ import annotations
 
 import io
@@ -123,6 +122,8 @@ def ocr_boxes_for_page(
     page_index: int,
     patterns: List[PatternItem] | None = None,
     min_score: float = 0.5,
+    stats_ok: Dict[str, int] | None = None,
+    stats_fail: Dict[str, int] | None = None,
 ) -> List[Box]:
     page = doc.load_page(page_index)
     page_rect = page.rect
@@ -131,10 +132,6 @@ def ocr_boxes_for_page(
     img, img_w, img_h = _page_to_image_rgb(page)
     print(f"{log_prefix} [OCR] page={page_index + 1} image={img_w}x{img_h}")
 
-    # run_paddle_ocr 내부에서 이미
-    #  - 멀티라인 카드번호 후보 병합
-    #  - 텍스트/score/bbox 정규화
-    # 를 마친 상태의 OcrItem 리스트를 돌려준다.
     ocr_items: List[OcrItem] = run_paddle_ocr(img, min_score=min_score)
     print(f"{log_prefix} [OCR] page={page_index + 1} ocr_items={len(ocr_items)}")
 
@@ -143,7 +140,6 @@ def ocr_boxes_for_page(
 
     boxes: List[Box] = []
 
-    # --- 1) 기본: 각 OCR 아이템 단위로 매칭 -----------------------------------
     for item in ocr_items:
         print(f"{log_prefix} [OCR RAW] page={page_index + 1} text={repr(item.text)} score={item.score}")
         text = cleanup_text(item.text)
@@ -167,6 +163,22 @@ def ocr_boxes_for_page(
                     continue
 
                 ok = _is_valid_value(need_valid, validator, val)
+
+                if stats_ok is not None and stats_fail is not None:
+                    if ok:
+                        stats_ok[rule_name] = stats_ok.get(rule_name, 0) + 1
+                    else:
+                        stats_fail[rule_name] = stats_fail.get(rule_name, 0) + 1
+
+                print(
+                    f"{log_prefix} MATCH(OCR)",
+                    "page=", page_index + 1,
+                    "rule=", rule_name,
+                    "need_valid=", need_valid,
+                    "ok=", ok,
+                    "value=", repr(val),
+                )
+
                 if not ok:
                     continue
 
@@ -188,7 +200,6 @@ def ocr_boxes_for_page(
                 )
                 matched = True
 
-        # 이메일은 정규식에서 누락되더라도 '@' 포함 시 보정
         if (not matched) and (not allowed_names or "email" in allowed_names) and "@" in text:
             x0_img, y0_img, x1_img, y1_img = item.bbox
 
@@ -235,7 +246,6 @@ def detect_boxes_from_patterns(
 
     try:
         page_count = len(doc)
-        # --- 1) 기존 텍스트 기반 탐지 ---
         for pno in range(page_count):
             page = doc.load_page(pno)
             raw_text = page.get_text("text") or ""
@@ -300,10 +310,9 @@ def detect_boxes_from_patterns(
                             Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
                         )
 
-        # --- 2) OCR 기반 탐지 추가 ---
         if use_ocr:
             for pno in range(page_count):
-                ocr_bs = ocr_boxes_for_page(doc, pno, patterns)
+                ocr_bs = ocr_boxes_for_page(doc, pno, patterns, stats_ok=stats_ok, stats_fail=stats_fail)
                 for b in ocr_bs:
                     print(
                         f"{log_prefix}[OCR] BOX",
