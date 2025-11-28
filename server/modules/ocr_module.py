@@ -1,4 +1,3 @@
-# server/modules/ocr_module.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,11 +23,8 @@ _ocr = PaddleOCR(
 )
 
 # ── 카드번호/멀티라인 카드 후보 처리를 위한 유틸 ──────────────────────────────
-
-# 일반적인 카드번호 패턴: 4-4-4-4 (구분자는 공백/하이픈 허용)
 _CARD_FULL_RE = re.compile(r"(?:\d{4}[- ]?){3}\d{4}")
 
-# 일반적인 이메일 패턴 (멀티라인 병합에도 재사용)
 _EMAIL_FULL_RE = re.compile(
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 )
@@ -39,7 +35,7 @@ def _digits_only(text: str) -> str:
 
 
 def _format_card_16(digits: str) -> str:
-    """16자리 숫자를 표준 카드번호 포맷(####-####-####-####)으로 변환."""
+    #16자리 숫자를 표준 카드번호 포맷(####-####-####-####)으로 변환.
     d = (digits or "").strip()
     if len(d) != 16:
         return d
@@ -64,7 +60,6 @@ def _is_vertically_stacked(
     b1: Tuple[float, float, float, float],
     b2: Tuple[float, float, float, float],
 ) -> bool:
-    """b2가 b1 바로 아래 줄에 있는지(세로로 쌓인 카드번호 후보인지) 판단."""
     x0_1, y0_1, x1_1, y1_1 = b1
     x0_2, y0_2, x1_2, y2_2 = b2
 
@@ -90,10 +85,7 @@ def _is_vertically_stacked(
 
 
 def _merge_multiline_card_candidates(items: List[OcrItem]) -> List[OcrItem]:
-    """
-    OCR 결과 중에서 카드번호가 두 줄로 잘려 있는 경우를 합쳐서
-    하나의 OcrItem(bbox, text=정규화된 카드번호)으로 만든다.
-    """
+    #카드번호 2줄로 잘려있는 경우 합치는 로직
     if not items:
         return items
 
@@ -162,8 +154,7 @@ def _merge_multiline_card_candidates(items: List[OcrItem]) -> List[OcrItem]:
 
 
 def _merge_multiline_email_candidates(items: List[OcrItem]) -> List[OcrItem]:
-    """차트 축 레이블처럼 이메일이 두 줄로 잘려 있는 경우
-    (예: 'bonam0806@naver.' + 'com')를 하나의 OcrItem으로 합친다."""
+    # 이메일이 잘려있는 경우 합치는 로직
     if not items:
         return items
 
