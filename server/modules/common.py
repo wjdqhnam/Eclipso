@@ -19,7 +19,6 @@ __all__ = [
     "HWPX_BLANK_PREVIEW",
 ]
 
-# 옵션
 HWPX_STRIP_PREVIEW = False
 HWPX_DISABLE_CACHE = True
 HWPX_BLANK_PREVIEW = True

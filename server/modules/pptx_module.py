@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+import logging
 from typing import List, Tuple
 
 # ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
@@ -27,6 +28,10 @@ except Exception:
 
 
 from server.core.schemas import XmlMatch, XmlLocation
+
+log = logging.getLogger("xml_redaction")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
 
 def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
     parts: List[str] = []
@@ -185,6 +190,12 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 # ────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
+    log.info(
+        "[PPTX][RED] filename=%s low=%s size=%d",
+        filename,
+        low,
+        len(data) if isinstance(data, (bytes, bytearray)) else -1,
+    )
 
     if low.startswith("ppt/slides/") and low.endswith(".xml"):
         b, _ = sub_text_nodes(data, comp)
@@ -198,4 +209,29 @@ def redact_item(filename: str, data: bytes, comp):
     if low.startswith("ppt/embeddings/") and low.endswith(".xlsx"):
         return redact_embedded_xlsx_bytes(data)
 
+    if low.startswith("ppt/media/") and low.endswith(IMAGE_EXTS):
+        log.info("[PPTX][IMG] image=%s size=%d", filename, len(data))
+        return data
+
     return data
+
+
+def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    out: List[Tuple[str, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+        names = zipf.namelist()
+        log.info("[PPTX][IMG-EXTRACT] entries=%d", len(names))
+        for name in names:
+            low = name.lower()
+            if not low.startswith("ppt/media/"):
+                continue
+            if not low.endswith(IMAGE_EXTS):
+                continue
+            try:
+                data = zipf.read(name)
+            except KeyError:
+                continue
+            out.append((name, data))
+            log.info("[PPTX][IMG-EXTRACT] name=%s size=%d", name, len(data))
+    log.info("[PPTX][IMG-EXTRACT] total=%d", len(out))
+    return out

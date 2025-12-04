@@ -21,6 +21,9 @@ except Exception:
 
 # schemas 임포트: core 우선, 실패 시 대안 경로 시도
 from server.core.schemas import XmlMatch, XmlLocation
+import logging
+
+log = logging.getLogger("xml_redaction")
 
 
 # ────────────────────────────────────────────────────
@@ -184,6 +187,7 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 # 파일 단위 레닥션: 시트/공유문자열/차트 처리
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
+    log.info("[XLSX][RED] filename=%s low=%s size=%d", filename, low, len(data))
 
     if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
         b, _ = sub_text_nodes(data, comp)
@@ -193,4 +197,24 @@ def redact_item(filename: str, data: bytes, comp):
         b2, _ = chart_sanitize(data, comp)
         return b2
 
+    if low.startswith("xl/media/") and low.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+        log.info("[XLSX][IMG] image=%s size=%d", filename, len(data))
+        return data
+
     return data
+
+
+def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    out: List[Tuple[str, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as z:
+        for name in z.namelist():
+            low = name.lower()
+            # XLSX 이미지 경로
+            if low.startswith("xl/media/") and low.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                try:
+                    data = z.read(name)
+                    out.append((name, data))
+                    log.info(f"[XLSX][IMG] image={name} size={len(data)}")
+                except KeyError:
+                    pass
+    return out

@@ -104,7 +104,6 @@ def extract_text(file_bytes: bytes) -> dict:
         txt, flags=re.IGNORECASE
     )
     txt = re.sub(r"General(?=\s*\d)", "", txt, flags=re.IGNORECASE)
-
     cleaned = cleanup_text(txt)
     return {"full_text": cleaned, "pages": [{"page": 1, "text": cleaned}]}
 

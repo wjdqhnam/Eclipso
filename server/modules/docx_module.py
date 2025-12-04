@@ -6,7 +6,6 @@ import zipfile
 import logging
 from typing import List, Tuple
 
-# 공통 유틸/스키마
 from .common import (
     cleanup_text,
     compile_rules,
