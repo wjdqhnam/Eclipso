@@ -145,18 +145,27 @@ def _collect_targets_by_regex(text: str) -> List[str]:
     targets = sorted(set(targets), key=lambda x: (-len(x), x))
     return targets
 
-# ParaText 전용 인코딩 함수 (utf-16 고정)
+# ParaText 전용 replace 함수 (utf-16 고정)
 def _replace_utf16le_keep_len(buf: bytes, t: str) -> Tuple[bytes, int]:
     if not t:
         return buf, 0
+
     pat = t.encode("utf-16le", "ignore")
-    rep = ("*" * len(t)).encode("utf-16le")
+
+    rep_str = ""
+    for ch in t:
+        if ch == "-":
+            rep_str += "-"
+        else:
+            rep_str += "*"
+
+    rep = rep_str.encode("utf-16le")
     count = buf.count(pat)
     if count:
         buf = buf.replace(pat, rep)
     return buf, count
 
-# BinData 내부 전용 인코딩 함수
+# BinData 내부 전용 replace 함수
 def _replace_in_bindata(raw: bytes, t: str) -> Tuple[bytes, int]:
     total = 0
     out = raw
@@ -165,7 +174,15 @@ def _replace_in_bindata(raw: bytes, t: str) -> Tuple[bytes, int]:
             pat = t.encode(enc, "ignore")
             if not pat:
                 continue
-            rep = (("*" * len(t)).encode("utf-16le") if enc == "utf-16le" else b"*" * len(pat))
+
+            rep_str = ""
+            for ch in t:
+                if ch == "-":
+                    rep_str += "-"
+                else:
+                    rep_str += "*"
+
+            rep = (rep_str.encode("utf-16le") if enc == "utf-16le" else b"*" * len(pat))
             hits = out.count(pat)
             if hits:
                 out = out.replace(pat, rep)
@@ -177,6 +194,7 @@ def _replace_in_bindata(raw: bytes, t: str) -> Tuple[bytes, int]:
 
 # main 레닥션 함수
 def redact(file_bytes: bytes) -> bytes:
+    print("레닥션 시작")
     container = bytearray(file_bytes)
     full_raw = extract_text(file_bytes)["full_text"]
     full_norm = normalization_text(full_raw)
@@ -184,6 +202,7 @@ def redact(file_bytes: bytes) -> bytes:
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         streams = ole.listdir(streams=True, storages=False)
+        print("[DEBUG streams] =>", streams) #디버깅용
         cutoff = getattr(ole, "minisector_cutoff", 4096)
 
         # BodyText/Section*
@@ -239,5 +258,37 @@ def redact(file_bytes: bytes) -> bytes:
             if not entry:
                 continue
             _overwrite_bigfat(ole, container, entry.isectStart, rep)
+
+        # PrvText
+        for path in streams:
+            if len(path) == 1:
+                name = path[0].lower()
+                if "prv" in name and "text" in name:
+                    print("[DEBUG] PrvText detected:", path)
+
+                    raw = ole.openstream(path).read()
+
+                    try:
+                        text = raw.decode("utf-16le", "ignore")
+                    except:
+                        text = ""
+
+                    new_raw = raw
+                    for t in targets:
+                        new_raw, _ = _replace_utf16le_keep_len(new_raw, t)
+
+                    if len(new_raw) < len(raw):
+                        new_raw = new_raw + b"\x00" * (len(raw) - len(new_raw))
+                    elif len(new_raw) > len(raw):
+                        new_raw = new_raw[:len(raw)]
+
+                    entry = _direntry_for(ole, path)
+                    if entry:
+                        if entry.size < cutoff:
+                            _overwrite_minifat_chain(ole, container, entry.isectStart, new_raw)
+                        else:
+                            _overwrite_bigfat(ole, container, entry.isectStart, new_raw)
+
+                    print("prvtext 레닥션 완료!", path)
 
     return bytes(container)
