@@ -7,6 +7,7 @@ from server.core.normalize import normalization_text
 from server.core.matching import find_sensitive_spans  
 
 TAG_PARA_TEXT = 67
+TAG_PICTURE = 0x04F
 
 # ─────────────────────────────
 # 압축 관련 유틸리티
@@ -190,6 +191,38 @@ def _replace_in_bindata(raw: bytes, t: str) -> Tuple[bytes, int]:
         except Exception:
             pass
     return out, total
+
+# ─────────────────────────────
+# 이미지 추출 관련 함수
+# ─────────────────────────────
+
+# 이미지 레코드 찾기 반복자
+def _iter_picture_records(section_dec: bytes):
+    off, n = 0, len(section_dec)
+    while off + 4 <= n:
+        hdr = struct.unpack_from("<I", section_dec, off)[0]
+        tag = hdr & 0x3FF           
+        size = (hdr >> 20) & 0xFFF  
+        off += 4
+        if off + size > n:
+            break
+
+        if tag == TAG_PICTURE:
+            yield section_dec[off:off+size]
+
+        off += size
+
+def extract_picture(payload: bytes) -> int:
+    # 개체 공통속성길이 파싱
+    off = 0
+    off += 4 * 7 # 제어ID, 속성, 세로off, 가로off, 폭, 높이, 층위, 
+    off += 2 * 4 # 바깥 4방향 여백
+    off += 4 * 2 #instance, 쪽 나눔 방지
+
+    desc_len = struct.unpack_from("<H", payload, off)[0]
+    off += 2
+
+    off += desc_len * 2 # 개체 설명문 길이
 
 
 # main 레닥션 함수
