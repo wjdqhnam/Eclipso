@@ -1,0 +1,18 @@
+2025-12-09 16:24:16,308 - __main__ - INFO - If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384
+2025-12-09 16:24:25,345 - __main__ - INFO - If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384
+2025-12-09 16:25:07,408 - __main__ - INFO - If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384
+2025-12-09 16:25:16,422 - __main__ - INFO - If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384
+2025-12-09 17:10:37,988 - __main__ - INFO - If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384
+2025-12-09 17:10:38,019 - __main__ - INFO - Got --pdfs argument, going to add to the work queue
+2025-12-09 17:10:38,026 - __main__ - INFO - Loading file at C:\Users\admin\AppData\Local\Temp\eclipso_olmocr\run_cef58d4d\input.png as image document
+2025-12-09 17:10:38,026 - __main__ - INFO - Found 1 total pdf paths to add
+2025-12-09 17:10:38,032 - __main__ - WARNING - Failed to read C:\Users\admin\AppData\Local\Temp\eclipso_olmocr\run_cef58d4d\input.png: [Errno 13] Permission denied: 'C:\\Users\\admin\\AppData\\Local\\Temp\\tmpnhjxnu20.pdf'
+2025-12-09 17:10:38,032 - __main__ - WARNING - Could not read any PDFs to estimate average page count.
+2025-12-09 17:10:38,032 - __main__ - INFO - Calculated items_per_group: 50 based on average pages per PDF: 10.00
+2025-12-09 17:10:47,368 - __main__ - INFO - If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384
+2025-12-09 17:10:47,398 - __main__ - INFO - Got --pdfs argument, going to add to the work queue
+2025-12-09 17:10:47,405 - __main__ - INFO - Loading file at C:\Users\admin\AppData\Local\Temp\eclipso_olmocr\run_51af2088\input.png as image document
+2025-12-09 17:10:47,405 - __main__ - INFO - Found 1 total pdf paths to add
+2025-12-09 17:10:47,409 - __main__ - WARNING - Failed to read C:\Users\admin\AppData\Local\Temp\eclipso_olmocr\run_51af2088\input.png: [Errno 13] Permission denied: 'C:\\Users\\admin\\AppData\\Local\\Temp\\tmpqtx6doad.pdf'
+2025-12-09 17:10:47,409 - __main__ - WARNING - Could not read any PDFs to estimate average page count.
+2025-12-09 17:10:47,409 - __main__ - INFO - Calculated items_per_group: 50 based on average pages per PDF: 10.00
