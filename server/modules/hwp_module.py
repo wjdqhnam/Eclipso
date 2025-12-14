@@ -220,36 +220,6 @@ def discover_ole_bindata_ids_strict(section_bytes: bytes) -> List[int]:
 
 
 # ─────────────────────────────
-# 문자 추출
-# ─────────────────────────────
-# BodyText에서 전체 텍스트 추출
-def extract_text(file_bytes: bytes) -> dict:
-    texts: List[str] = []
-
-    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
-        for path in ole.listdir(streams=True, storages=False):
-            if len(path) < 2 or path[0] != "BodyText" or not path[1].startswith("Section"):
-                continue
-
-            dec, _ = _decompress(ole.openstream(path).read())
-            for tag, _, payload, _, _ in iter_hwp_records(dec):
-                if tag == TAG_PARA_TEXT:
-                    texts.append(payload.decode("utf-16le", "ignore"))
-
-    full = "\n".join(texts)
-    return {"full_text": full, "pages": [{"page": 1, "text": full}]}
-
-
-# 본문 기준 민감 문자열 수집
-def _collect_targets_by_regex(text: str) -> List[str]:
-    targets: List[str] = []
-    for _, _, val, _ in find_sensitive_spans(text):
-        if val and val.strip():
-            targets.append(val)
-    return sorted(set(targets), key=lambda x: (-len(x), x))
-
-
-# ─────────────────────────────
 # 바이트 치환 유틸
 # ─────────────────────────────
 # 특정 인코딩 기준 동일 길이 마스킹
@@ -444,6 +414,98 @@ def _replace_in_bindata_smart(raw: bytes) -> Tuple[bytes, int]:
         return raw, 0
 
     return out, total_hits
+
+
+# ─────────────────────────────
+# 문자 추출
+# ─────────────────────────────
+def _extract_all_strings_from_blob(blob: bytes) -> List[str]:
+    out: List[str] = []
+
+    for enc in ("utf-16le", "utf-8", "cp949"):
+        try:
+            text = blob.decode(enc, "ignore")
+        except Exception:
+            continue
+
+        for line in text.splitlines():
+            line = line.strip()
+            if len(line) >= 2:
+                out.append(line)
+
+    return out
+
+
+def extract_chart_texts(file_bytes: bytes) -> List[str]:
+    texts: List[str] = []
+
+    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+        streams = ole.listdir(streams=True, storages=False)
+
+        bindata_paths = [
+            tuple(p) for p in streams
+            if len(p) >= 2 and p[0] == "BinData" and p[1].endswith(".OLE")
+        ]
+
+        for path in bindata_paths:
+            try:
+                raw = ole.openstream(path).read()
+            except Exception:
+                continue
+
+            # 1) 압축 안 된 영역
+            texts += _extract_all_strings_from_blob(raw)
+
+            # 2) 압축 영역
+            for kind, off in scan_deflate(raw, limit=32, step=128):
+                decinfo = decomp_bin(raw, off, kind)
+                if not decinfo:
+                    continue
+
+                dec, _ = decinfo
+                texts += _extract_all_strings_from_blob(dec)
+
+    # 중복 제거
+    return sorted(set(t.strip() for t in texts if t.strip()))
+
+
+def extract_text(file_bytes: bytes) -> dict:
+    body_texts = []
+    chart_texts = []
+
+    with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+        # 1) BodyText
+        for path in ole.listdir(streams=True, storages=False):
+            if len(path) < 2 or path[0] != "BodyText":
+                continue
+
+            dec, _ = _decompress(ole.openstream(path).read())
+            for tag, _, payload, _, _ in iter_hwp_records(dec):
+                if tag == TAG_PARA_TEXT:
+                    body_texts.append(payload.decode("utf-16le", "ignore"))
+
+    # 2) 차트 텍스트
+    chart_texts = extract_chart_texts(file_bytes)
+
+    return {
+        "full_text": "\n".join(body_texts + chart_texts),
+        "pages": [
+            {
+                "page": 1,
+                "text": "\n".join(body_texts),
+                "charts": chart_texts,
+            }
+        ],
+    }
+
+
+# 본문 기준 민감 문자열 수집
+def _collect_targets_by_regex(text: str) -> List[str]:
+    targets: List[str] = []
+    for _, _, val, _ in find_sensitive_spans(text):
+        if val and val.strip():
+            targets.append(val)
+    return sorted(set(targets), key=lambda x: (-len(x), x))
 
 
 # ─────────────────────────────
