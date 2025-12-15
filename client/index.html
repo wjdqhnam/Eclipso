@@ -5,27 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
 
-    <!-- Tailwind -->
+    <!-- Tailwind & PDF.js -->
     <script src="https://cdn.tailwindcss.com"></script>
-
-    <!-- PDF.js (PDF 미리보기용) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
     <script>
+      // API_BASE 자동 설정 (로컬/배포 공용)
       const origin = window.location.origin
       window.API_BASE =
         origin.includes('127.0.0.1') || origin.includes('localhost')
           ? 'http://127.0.0.1:8000'
           : origin.replace(/\/$/, '')
 
+      // (선택) HWPX 뷰어 URL
       window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
 
-      window.addEventListener('DOMContentLoaded', () => {
-        if (window['pdfjsLib']) {
-          pdfjsLib.GlobalWorkerOptions.workerSrc =
-            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-        }
-      })
+      // pdf.js 워커 경로
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
   </head>
 
@@ -53,7 +50,7 @@
             <!-- 파일 업로드 -->
             <div>
               <label class="block text-sm font-medium mb-2">파일 업로드</label>
-              <div
+              <label
                 id="dropzone"
                 for="file"
                 class="block cursor-pointer rounded-xl border-2 border-dashed border-gray-300 hover:border-gray-400 bg-gray-50 px-4 py-6 text-center transition"
@@ -72,7 +69,7 @@
                 </div>
 
                 <div id="file-name" class="mt-2 text-xs text-gray-400"></div>
-              </div>
+              </label>
               <input
                 id="file"
                 type="file"
@@ -152,10 +149,6 @@
                   <input id="ner-show-og" type="checkbox" checked />
                   <span>기관(OG)</span>
                 </label>
-                <label class="flex items-center gap-2">
-                  <input id="ner-show-dt" type="checkbox" checked />
-                  <span>날짜(DT)</span>
-                </label>
               </div>
             </fieldset>
 
@@ -173,13 +166,6 @@
                 disabled
               >
                 레닥션 결과 다운로드
-              </button>
-              <button
-                id="btn-save-report"
-                class="w-full px-4 py-2.5 rounded-lg border border-gray-300 hover:bg-gray-50 transition hidden"
-                disabled
-              >
-                PDF 리포트 다운로드
               </button>
             </div>
 
@@ -203,6 +189,10 @@
               class="w-full h-48 border rounded p-2 font-mono"
               readonly
             ></textarea>
+            <div
+              id="text-table-preview"
+              class="mt-3 text-xs text-gray-800 overflow-x-auto"
+            ></div>
           </div>
 
           <!-- 매칭 결과(토글) -->
@@ -295,11 +285,35 @@
                   class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
                   >0</span
                 >
+                <svg
+                  data-chevron="ner"
+                  class="h-5 w-5 text-gray-500 transition-transform"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                >
+                  <path
+                    fill-rule="evenodd"
+                    d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
+                    clip-rule="evenodd"
+                  />
+                </svg>
               </div>
             </button>
             <div id="ner-body" class="p-5 border-t">
-              <div id="ner-summary" class="text-sm text-gray-500 mb-4"></div>
-              <div id="ner-groups" class="space-y-3"></div>
+              <div id="ner-summary" class="text-sm text-gray-500 mb-3"></div>
+              <div class="overflow-auto">
+                <table class="min-w-full text-sm">
+                  <thead>
+                    <tr class="border-b bg-gray-50">
+                      <th class="text-left py-2 px-2">Label</th>
+                      <th class="text-left py-2 px-2">Text</th>
+                      <th class="text-left py-2 px-2">Score</th>
+                      <th class="text-left py-2 px-2">Pos</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ner-rows"></tbody>
+                </table>
+              </div>
             </div>
           </div>
 
@@ -331,6 +345,25 @@
                 id="pdf-preview"
                 class="w-full rounded border border-gray-200"
               ></canvas>
+            </div>
+          </div>
+
+          <!-- NER 문서 통계 -->
+          <div
+            id="ner-metrics-block"
+            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
+          >
+            <div class="px-5 py-3 border-b flex items-center justify-between">
+              <h2 class="font-semibold">NER 문서 통계</h2>
+              <span class="text-xs text-gray-400">현재 업로드한 문서 기준</span>
+            </div>
+            <div class="p-5 space-y-3 text-sm">
+              <div
+                id="ner-metrics-output"
+                class="text-xs text-gray-800 whitespace-pre-line"
+              >
+                문서를 스캔하면 NER 통계가 여기에 표시됩니다.
+              </div>
             </div>
           </div>
         </section>

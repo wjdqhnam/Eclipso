@@ -7,17 +7,14 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel))
 let __lastRedactedBlob = null
 let __lastRedactedName = 'redacted.bin'
 
-// html escape
 const esc = (s) =>
   (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-// 배지
 const badge = (sel, n) => {
   const el = $(sel)
   if (el) el.textContent = String(n ?? 0)
 }
 
-// 아코디언
 const setOpen = (name, open) => {
   const cont =
     name === 'pdf' ? $('#pdf-preview-block') : $(`#${name}-result-block`)
@@ -35,7 +32,6 @@ document.addEventListener('click', (e) => {
   setOpen(name, body ? body.classList.contains('hidden') : true)
 })
 
-// 규칙 로드
 async function loadRules() {
   try {
     const r = await fetch(`${API_BASE()}/text/rules`)
@@ -60,7 +56,14 @@ function selectedRuleNames() {
   return $$('input[name="rule"]:checked').map((el) => el.value)
 }
 
-// 드롭존
+function selectedNerLabels() {
+  const labels = []
+  $('#ner-show-ps')?.checked !== false && labels.push('PS')
+  $('#ner-show-lc')?.checked !== false && labels.push('LC')
+  $('#ner-show-og')?.checked !== false && labels.push('OG')
+  return labels
+}
+
 function setupDropZone() {
   const dz = $('#dropzone'),
     input = $('#file'),
@@ -130,7 +133,6 @@ function setupDropZone() {
   input.addEventListener('change', (e) => showName(e.target.files?.[0] || null))
 }
 
-// PDF 프리뷰(1페이지)
 async function renderRedactedPdfPreview(blob) {
   const cv = $('#pdf-preview')
   if (!cv) return
@@ -145,20 +147,21 @@ async function renderRedactedPdfPreview(blob) {
   await page.render({ canvasContext: g, viewport: vp }).promise
 }
 
-// 텍스트 하이라이트
-const take = (s, n) => (s.length <= n ? s : s.slice(0, n) + '…')
-function highlightFrag(ctx, val, pad = 60) {
-  const i = (ctx || '').indexOf(val || '')
-  if (i < 0) return esc(take(ctx || '', 140))
-  const start = Math.max(0, i - pad)
-  const end = Math.min((ctx || '').length, i + (val || '').length + pad)
-  const pre = esc((ctx || '').slice(start, i))
-  const mid = esc(val || '')
-  const post = esc((ctx || '').slice(i + (val || '').length, end))
+function highlightFrag(ctx, val) {
+  const src = ctx || ''
+  const needle = val || ''
+
+  const i = src.indexOf(needle)
+  if (i < 0) return esc(src)
+
+  const pre = esc(src.slice(0, i))
+  const mid = esc(needle)
+  const post = esc(src.slice(i + needle.length))
+
   return pre + `<mark class="bg-yellow-200 rounded px-1">${mid}</mark>` + post
 }
 
-let __segFilter = 'all' // all | ok | fail
+let __segFilter = 'all'
 function applySegmentFilter(root) {
   root.querySelectorAll('[data-valid]').forEach((el) => {
     const ok = el.getAttribute('data-valid') === '1'
@@ -194,6 +197,7 @@ function wireSegmentButtons(root) {
   $('#seg-fail')?.addEventListener('click', () => setActive('fail'))
   setActive(__segFilter)
 }
+
 function renderRegexResults(res) {
   const items = Array.isArray(res?.items) ? res.items : []
   badge('#match-badge', items.length)
@@ -255,7 +259,6 @@ function renderRegexResults(res) {
         'border rounded-xl p-3 bg-white hover:shadow-sm transition ' +
         (isOk ? 'border-emerald-200' : 'border-rose-200')
 
-      // 값은 평문 모노스페이스, 불필요한 배경/박스 제거
       card.innerHTML = `
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
@@ -302,6 +305,114 @@ function renderRegexResults(res) {
   applySegmentFilter(wrap)
 }
 
+function parseMarkdownTables(markdown) {
+  const lines = (markdown || '').split(/\r?\n/)
+  const tables = []
+  let current = []
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      current.push(line)
+    } else {
+      if (current.length >= 2) tables.push(current.slice())
+      current = []
+    }
+  }
+  if (current.length >= 2) tables.push(current.slice())
+  return tables
+}
+
+function tableBlockToHtml(block) {
+  if (!block || block.length < 2) return ''
+  const headerLine = block[0]
+  const headerCells = headerLine
+    .split('|')
+    .slice(1, -1)
+    .map((s) => s.trim())
+  const bodyLines = block.slice(2)
+
+  let html =
+    '<table class="min-w-full border border-gray-300 text-[11px] text-left border-collapse">'
+  html += '<thead><tr>'
+  for (const h of headerCells) {
+    html += `<th class="border border-gray-300 px-2 py-1 bg-gray-50">${esc(
+      h
+    )}</th>`
+  }
+  html += '</tr></thead><tbody>'
+
+  for (const line of bodyLines) {
+    const cells = line
+      .split('|')
+      .slice(1, -1)
+      .map((s) => s.trim())
+    if (!cells.length) continue
+    html += '<tr>'
+    for (const c of cells) {
+      html += `<td class="border border-gray-300 px-2 py-1 align-top">${esc(
+        c
+      )}</td>`
+    }
+    html += '</tr>'
+  }
+  html += '</tbody></table>'
+  return html
+}
+
+function buildPlainTextFromMarkdown(markdown) {
+  const lines = (markdown || '').split(/\r?\n/)
+  const out = []
+  let inTable = false
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    const isTableRow = /^\s*\|.*\|\s*$/.test(line)
+
+    if (isTableRow) {
+      inTable = true
+      continue
+    }
+
+    if (!isTableRow && inTable) inTable = false
+    if (!inTable) out.push(raw)
+  }
+
+  return out.join('\n').trim()
+}
+
+function renderTablePreview(markdown) {
+  const wrap = $('#text-table-preview')
+  if (!wrap) return 0
+  wrap.innerHTML = ''
+
+  const blocks = parseMarkdownTables(markdown)
+  if (!blocks.length) return 0
+
+  const parts = []
+  parts.push(
+    '<div class="text-[11px] text-gray-500 mb-1">표 구조 미리보기</div>'
+  )
+  blocks.forEach((block, idx) => {
+    if (idx > 0) parts.push('<div class="h-2"></div>')
+    parts.push(tableBlockToHtml(block))
+  })
+  wrap.innerHTML = parts.join('')
+  return blocks.length
+}
+
+const JOIN_NEWLINE_RE = /([\w\uAC00-\uD7A3.%+\-/])\n([\w\uAC00-\uD7A3.%+\-/])/g
+function joinBrokenLines(text) {
+  if (!text) return ''
+  let t = String(text).replace(/\r\n/g, '\n')
+  let prev = null
+  while (prev !== t) {
+    prev = t
+    t = t.replace(JOIN_NEWLINE_RE, '$1$2')
+  }
+  return t
+}
+
 function normalizeNerItems(raw, srcText = '') {
   if (!raw) return { items: [] }
   let arr = []
@@ -310,7 +421,6 @@ function normalizeNerItems(raw, srcText = '') {
   else if (Array.isArray(raw.result?.entities)) arr = raw.result.entities
   else if (Array.isArray(raw)) arr = raw
 
-  // /text/detect 폴백 형태: final_spans에서 source==='ner'
   if (!arr.length && Array.isArray(raw.final_spans)) {
     const spans = raw.final_spans.filter(
       (s) => (s.source || '').toLowerCase() === 'ner'
@@ -332,7 +442,6 @@ function normalizeNerItems(raw, srcText = '') {
     })
   }
 
-  // 필드 스펙 표준화
   const map = (e) => ({
     label: e.label ?? e.entity ?? e.tag ?? '',
     text: e.text ?? e.word ?? e.value ?? '',
@@ -352,35 +461,35 @@ function normalizeNerItems(raw, srcText = '') {
   })
   return { items: arr.map(map) }
 }
-async function requestNerSmart(text) {
-  // 1) /text/ner
+
+async function requestNerSmart(text, exclude_spans) {
+  const labels = selectedNerLabels()
+  const payload = { text }
+  if (labels.length) payload.labels = labels
+  if (Array.isArray(exclude_spans) && exclude_spans.length)
+    payload.exclude_spans = exclude_spans
+
   try {
-    const r = await fetch(`${API_BASE()}/text/ner`, {
+    const r2 = await fetch(`${API_BASE()}/ner/predict`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(payload),
     })
-    if (r.ok) {
-      const j = await r.json()
-      const n = normalizeNerItems(j)
-      if (n.items.length) return n
+    if (!r2.ok) {
+      const txt = await r2.text()
+      console.error('NER 요청 실패', r2.status, txt)
+      setStatus(`NER 분석 실패 (${r2.status})`)
+      return { items: [] }
     }
-  } catch {}
-  // 2) /text/detect (run_ner)
-  const r2 = await fetch(`${API_BASE()}/text/detect`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      text,
-      options: { run_regex: false, run_ner: true },
-    }),
-  })
-  if (!r2.ok) return { items: [] }
-  const j2 = await r2.json()
-  return normalizeNerItems(j2, j2.text || text || '')
+    const j2 = await r2.json()
+    return normalizeNerItems(j2, text || '')
+  } catch (e) {
+    console.error('NER 요청 중 오류', e)
+    setStatus(`NER 분석 중 오류: ${e.message || e}`)
+    return { items: [] }
+  }
 }
 
-// NER 테이블
 function renderNerTable(ner) {
   const rows = $('#ner-rows')
   const sum = $('#ner-summary')
@@ -419,13 +528,141 @@ function renderNerTable(ner) {
   }
 }
 
-// 상태
+function renderNerDocStats(ner, srcText = '') {
+  const out = $('#ner-metrics-output')
+  if (!out) return
+
+  const items = Array.isArray(ner?.items) ? ner.items : []
+  const total = items.length
+
+  const byLabel = {}
+  for (const it of items) {
+    const lab = String(it.label || '').toUpperCase()
+    if (!lab) continue
+    byLabel[lab] = (byLabel[lab] || 0) + 1
+  }
+
+  const ranges = []
+  for (const it of items) {
+    const s = Number(it.start ?? 0)
+    const e = Number(it.end ?? 0)
+    if (!(e > s)) continue
+    ranges.push([s, e])
+  }
+  ranges.sort((a, b) => a[0] - b[0])
+  const merged = []
+  for (const [s, e] of ranges) {
+    if (!merged.length || s > merged[merged.length - 1][1]) merged.push([s, e])
+    else
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e)
+  }
+  let covered = 0
+  for (const [s, e] of merged) covered += Math.max(0, e - s)
+  const textLen = (srcText || '').length || 1
+  const coverage = covered / textLen
+
+  const wanted = ['PS', 'LC', 'OG', 'DT']
+
+  let maxCount = 0
+  for (const lab of wanted) maxCount = Math.max(maxCount, byLabel[lab] || 0)
+  if (!maxCount) maxCount = 1
+
+  const labelRows = wanted
+    .map((lab) => {
+      const cnt = byLabel[lab] || 0
+      const width = (cnt / maxCount) * 100
+      let colorHex = '#e5e7eb'
+      if (cnt > 0) {
+        if (lab === 'PS') colorHex = '#0ea5e9'
+        else if (lab === 'LC') colorHex = '#10b981'
+        else if (lab === 'OG') colorHex = '#f59e0b'
+        else if (lab === 'DT') colorHex = '#8b5cf6'
+      }
+      return `
+        <tr class="border-t border-gray-100">
+          <td class="px-2 py-1.5 text-[11px] font-medium text-gray-700">${lab}</td>
+          <td class="px-2 py-1.5 text-[11px] text-right text-gray-700">
+            <div class="w-full h-4 rounded-full bg-gray-100 overflow-hidden flex items-center justify-end pr-1">
+              <div class="h-4 rounded-full" style="width: ${width}%; background-color: ${colorHex};"></div>
+              <span class="ml-1 relative z-10 text-[11px] text-gray-800">${cnt}</span>
+            </div>
+          </td>
+        </tr>
+      `
+    })
+    .join('')
+
+  const coveragePct = (coverage * 100).toFixed(1)
+  const hasEntities = total > 0
+  const coverageBarStyle = hasEntities
+    ? 'background: linear-gradient(to right, #0ea5e9, #6366f1);'
+    : 'background-color: #e5e7eb;'
+
+  out.innerHTML = `
+    <div class="space-y-3">
+      <div class="flex items-center justify-between text-xs text-gray-700">
+        <div><span class="font-semibold">총 엔티티 수</span>: ${total}</div>
+      </div>
+
+      <div class="space-y-1">
+        <div class="flex items-center justify-between text-[11px] text-gray-500">
+          <span>문서 길이 대비 엔티티</span>
+          <span class="text-gray-700 font-medium">${coveragePct}%</span>
+        </div>
+        <div class="h-2 rounded-full bg-gray-100 overflow-hidden">
+          <div class="h-2" style="${coverageBarStyle} width: ${Math.min(
+    100,
+    coverage * 100
+  )}%;"></div>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto border border-gray-100 rounded-lg">
+        <table class="min-w-full text-[11px]">
+          <thead class="bg-gray-50 text-gray-500">
+            <tr>
+              <th class="px-2 py-1.5 text-left font-medium">Label</th>
+              <th class="px-2 py-1.5 text-right font-medium">Count</th>
+            </tr>
+          </thead>
+          <tbody>${labelRows}</tbody>
+        </table>
+      </div>
+    </div>
+  `
+}
+
 function setStatus(msg) {
   const el = $('#status')
   if (el) el.textContent = msg || ''
 }
 
-// 스캔 버튼
+function filterMatchByRules(matchData, rules) {
+  const allow = new Set((rules || []).map((r) => String(r).toLowerCase()))
+  const items = Array.isArray(matchData?.items) ? matchData.items : []
+  const kept = allow.size
+    ? items.filter((it) => allow.has(String(it.rule || '').toLowerCase()))
+    : items
+  const counts = {}
+  for (const it of kept) {
+    if (it?.valid) counts[it.rule] = (counts[it.rule] || 0) + 1
+  }
+  return { ...matchData, items: kept, counts }
+}
+
+function buildExcludeSpansFromMatch(matchData) {
+  const items = Array.isArray(matchData?.items) ? matchData.items : []
+  const spans = []
+  for (const it of items) {
+    if (it?.valid === false) continue
+    const s = Number(it.start ?? -1)
+    const e = Number(it.end ?? -1)
+    if (!(e > s)) continue
+    spans.push({ start: s, end: e })
+  }
+  return spans
+}
+
 $('#btn-scan')?.addEventListener('click', async () => {
   const f = $('#file')?.files?.[0]
   if (!f) return alert('파일을 선택하세요.')
@@ -435,7 +672,7 @@ $('#btn-scan')?.addEventListener('click', async () => {
     ? f.name.replace(/\.[^.]+$/, `_redacted.${ext}`)
     : `redacted.${ext}`
 
-  setStatus('텍스트 추출 및 매칭 중...')
+  setStatus('텍스트 추출 중...')
   const fd = new FormData()
   fd.append('file', f)
 
@@ -443,46 +680,123 @@ $('#btn-scan')?.addEventListener('click', async () => {
   $('#ner-result-block')?.classList.remove('hidden')
 
   try {
-    // 1) 텍스트 추출
     const r1 = await fetch(`${API_BASE()}/text/extract`, {
       method: 'POST',
       body: fd,
     })
     if (!r1.ok)
       throw new Error(`텍스트 추출 실패 (${r1.status})\n${await r1.text()}`)
-    const { full_text: text = '' } = await r1.json()
+    const extractData = await r1.json()
 
-    // 프리뷰
+    const fullText = extractData.full_text || ''
+    let analysisText = fullText || ''
+
     $('#text-preview-block')?.classList.remove('hidden')
     const ta = $('#txt-out')
-    if (ta) ta.value = text || '(본문 텍스트가 비어 있습니다.)'
+    if (ta) {
+      ta.classList.remove('hidden')
+      ta.value = analysisText || '(본문 텍스트가 비어 있습니다.)'
+    }
 
-    // 2) 정규식 매칭
+    const tablePreviewRoot = $('#text-table-preview')
+    if (tablePreviewRoot) tablePreviewRoot.innerHTML = ''
+
+    if (ext === 'pdf') {
+      try {
+        const fd2 = new FormData()
+        fd2.append('file', f)
+        const rMd = await fetch(`${API_BASE()}/text/markdown`, {
+          method: 'POST',
+          body: fd2,
+        })
+        if (rMd.ok) {
+          const mdData = await rMd.json()
+          let markdown = ''
+          if (typeof mdData.markdown === 'string') markdown = mdData.markdown
+          else if (Array.isArray(mdData.pages_md))
+            markdown = mdData.pages_md.join('\n\n')
+          else if (Array.isArray(mdData.pages))
+            markdown = mdData.pages.map((p) => p.markdown || '').join('\n\n')
+
+          if (markdown.trim()) analysisText = markdown
+
+          const tableCount = renderTablePreview(markdown)
+
+          const ta2 = $('#txt-out')
+          if (ta2) {
+            if (tableCount > 0) {
+              const plainPreview = buildPlainTextFromMarkdown(markdown)
+              if (plainPreview.trim()) {
+                ta2.classList.remove('hidden')
+                ta2.value = plainPreview
+              } else {
+                ta2.value = ''
+                ta2.classList.add('hidden')
+              }
+            } else {
+              ta2.classList.remove('hidden')
+              ta2.value = analysisText || ''
+            }
+          }
+        } else {
+          console.warn('markdown 추출 실패', rMd.status)
+        }
+      } catch (e) {
+        console.warn('markdown 추출 중 오류', e)
+      }
+    }
+
+    const normalizedText = joinBrokenLines(analysisText)
+
+    setStatus('정규식 매칭 중...')
     const rules = selectedRuleNames()
     const r2 = await fetch(`${API_BASE()}/text/match`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, rules, normalize: true }),
+      body: JSON.stringify({ text: normalizedText, rules, normalize: true }),
     })
     if (!r2.ok) throw new Error(`매칭 실패 (${r2.status})\n${await r2.text()}`)
-    renderRegexResults(await r2.json())
+    const rawMatchData = await r2.json()
+    const matchData = filterMatchByRules(rawMatchData, rules)
+    renderRegexResults(matchData)
     setOpen('match', true)
 
-    // 3) NER (스마트 호출)
-    const ner = await requestNerSmart(text)
-    renderNerTable(ner)
-    ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
-      $(sel)?.addEventListener('change', () => renderNerTable(ner))
-    )
-    setOpen('ner', true)
+    setStatus('NER 분석 중...')
+    if (!normalizedText.trim()) {
+      renderNerTable({ items: [] })
+      renderNerDocStats({ items: [] }, normalizedText)
+      setOpen('ner', true)
+    } else {
+      const excludeSpans = buildExcludeSpansFromMatch(matchData)
+      const ner = await requestNerSmart(normalizedText, excludeSpans)
+      renderNerTable(ner)
+      renderNerDocStats(ner, normalizedText)
+      $('#ner-metrics-block')?.classList.remove('hidden')
+      ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
+        $(sel)?.addEventListener('change', () => renderNerTable(ner))
+      )
+      setOpen('ner', true)
+    }
 
-    setStatus(`스캔 완료 (${ext.toUpperCase()} 처리)`)
+    setStatus(`스캔 완료 (${ext.toUpperCase()} 처리) — 레닥션 준비 중...`)
 
-    // 4) 레닥션 파일 생성
     setStatus('레닥션 파일 생성 중...')
+    const fdRedact = new FormData()
+    fdRedact.append('file', f)
+
+    const rulesForRedact = selectedRuleNames()
+    if (rulesForRedact.length) {
+      fdRedact.append('rules_json', JSON.stringify(rulesForRedact))
+    }
+
+    const nerLabelsForRedact = selectedNerLabels()
+    if (nerLabelsForRedact.length) {
+      fdRedact.append('ner_labels_json', JSON.stringify(nerLabelsForRedact))
+    }
+
     const r4 = await fetch(`${API_BASE()}/redact/file`, {
       method: 'POST',
-      body: fd,
+      body: fdRedact,
     })
     if (!r4.ok) throw new Error(`레닥션 실패 (${r4.status})`)
     const blob = await r4.blob()
@@ -508,7 +822,6 @@ $('#btn-scan')?.addEventListener('click', async () => {
   }
 })
 
-// 다운로드
 $('#btn-save-redacted')?.addEventListener('click', () => {
   if (!__lastRedactedBlob) return alert('레닥션된 파일이 없습니다.')
   const url = URL.createObjectURL(__lastRedactedBlob)
@@ -519,7 +832,6 @@ $('#btn-save-redacted')?.addEventListener('click', () => {
   URL.revokeObjectURL(url)
 })
 
-// 초기화
 document.addEventListener('DOMContentLoaded', () => {
   loadRules()
   setupDropZone()

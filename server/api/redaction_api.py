@@ -34,12 +34,7 @@ def _read_pdf(file: UploadFile) -> bytes:
 
 
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    """
-    입력 허용
-    - None / "" / 공백 / "null" / "None" -> PRESET_PATTERNS
-    - 배열: [ { ... } ]
-    - 객체: { "patterns": [ { ... } ] }
-    """
+
     if patterns_json is None:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
@@ -81,11 +76,6 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
 
 
 def _compile_patterns(items: List[PatternItem]) -> List[Any]:
-    """
-    PatternItem -> 어댑터 객체(SimpleNamespace)
-    - compiled: re.Pattern
-    - 기존 필드: 그대로 속성화
-    """
     compiled: List[Any] = []
     for it in items:
         # PatternItem 속성 추출

@@ -1,29 +1,146 @@
 from __future__ import annotations
+
 from fastapi import APIRouter, UploadFile, HTTPException
 from typing import Dict, Any, List
+import re
+import logging
 
 from server.utils.file_reader import extract_from_file
 from server.core.redaction_rules import PRESET_PATTERNS
 from server.api.redaction_api import match_text
 from server.modules.pdf_module import extract_markdown as extract_pdf_markdown
+from server.modules.ner_module import run_ner
 
 router = APIRouter(prefix="/text", tags=["text"])
+logger = logging.getLogger(__name__)
+
+# 기본 병합 정책(없으면 /text/policy에서 NameError 남)
+DEFAULT_POLICY: Dict[str, Any] = {
+    "chunk_size": 1500,
+    "chunk_overlap": 200,
+    "allowed_labels": ["PS", "LC", "OG", "DT"],
+}
+
+# 줄바꿈 합치기 (PDF text 보정용)
+_JOIN_NEWLINE_RE = re.compile(r"([\w\uAC00-\uD7A3.%+\-/])\n([\w\uAC00-\uD7A3.%+\-/])")
 
 
-@router.post(
-    "/extract",
-    summary="파일에서 텍스트 추출",
-    description="업로드한 문서에서 본문 텍스트를 추출하여 반환",
-)
+def _join_broken_lines(text: str | None) -> str:
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n")
+    prev = None
+    while prev != t:
+        prev = t
+        t = _JOIN_NEWLINE_RE.sub(r"\1\2", t)
+    return t
+
+
+def _normalize_newlines_in_obj(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return _join_broken_lines(obj)
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            obj[k] = _normalize_newlines_in_obj(v)
+        return obj
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            obj[i] = _normalize_newlines_in_obj(v)
+        return obj
+    return obj
+
+
+def _effective_policy(user_policy: Any) -> Dict[str, Any]:
+    p = dict(DEFAULT_POLICY)
+    if isinstance(user_policy, dict):
+        p.update(user_policy)
+    # allowed_labels가 비어 있으면 기본값 적용
+    if not isinstance(p.get("allowed_labels"), list) or not p.get("allowed_labels"):
+        p["allowed_labels"] = list(DEFAULT_POLICY["allowed_labels"])
+    # chunk_overlap 최소 안전값
+    try:
+        p["chunk_overlap"] = int(p.get("chunk_overlap", DEFAULT_POLICY["chunk_overlap"]))
+    except Exception:
+        p["chunk_overlap"] = DEFAULT_POLICY["chunk_overlap"]
+    try:
+        p["chunk_size"] = int(p.get("chunk_size", DEFAULT_POLICY["chunk_size"]))
+    except Exception:
+        p["chunk_size"] = DEFAULT_POLICY["chunk_size"]
+    return p
+
+
+# NER 후처리 필터 (핵심)
+def _is_valid_ner_span(span: Dict[str, Any]) -> bool:
+    text = (span.get("text") or "").strip()
+    label = span.get("label")
+
+    if not text:
+        return False
+
+    # 특수문자만 있는 경우 제거
+    if re.fullmatch(r"[^\w\uAC00-\uD7A3]+", text):
+        return False
+
+    # LC(주소)는 최소 길이 제한
+    if label == "LC" and len(text) < 5:
+        return False
+
+    return True
+
+
+# /text/extract
+@router.post("/extract")
 async def extract_text(file: UploadFile):
     try:
-        return await extract_from_file(file)
-    except HTTPException as e:
-        raise e
+        filename = (file.filename or "").lower()
+        raw_bytes = await file.read()
+        await file.seek(0)
+
+        data = await extract_from_file(file)
+
+        # PDF → Markdown을 full_text로 강제
+        if filename.endswith(".pdf"):
+            try:
+                md_info = extract_pdf_markdown(raw_bytes)
+                if md_info.get("markdown"):
+                    markdown = md_info["markdown"]
+                    data["full_text"] = markdown
+                    data["markdown"] = markdown
+                    if "pages" in md_info:
+                        data["pages"] = [
+                            {"page": p.get("page"), "text": p.get("markdown", "")}
+                            for p in (md_info.get("pages") or [])
+                        ]
+            except Exception as e:
+                logger.warning("PDF Markdown override 실패: %s", e)
+
+        data = _normalize_newlines_in_obj(data)
+        return data
+
     except Exception as e:
-        raise HTTPException(500, detail=f"서버 내부 오류: {e}")
+        raise HTTPException(500, detail=str(e))
 
 
+# /text/policy
+@router.get(
+    "/policy",
+    summary="기본 병합 정책 조회",
+    description="정규식·NER 탐지 결과를 병합할 때 사용하는 서버의 기본 정책을 반환",
+)
+async def get_policy():
+    return DEFAULT_POLICY
+
+
+@router.put(
+    "/policy",
+    summary="병합 정책 설정",
+    description=("허용 라벨/우선순위 등 병합 정책을 갱신.\n" "전달된 정책 객체를 그대로 반환"),
+)
+async def set_policy(policy: dict):
+    return {"ok": True, "policy": policy}
+
+
+# /text/rules
 @router.get(
     "/rules",
     summary="정규식 규칙 이름 목록",
@@ -33,6 +150,7 @@ async def list_rules():
     return [r["name"] for r in PRESET_PATTERNS]
 
 
+# /text/match
 @router.post(
     "/match",
     summary="정규식 매칭 실행",
@@ -43,135 +161,82 @@ async def match(req: dict):
     return match_text(text)
 
 
-@router.post(
-    "/detect",
-    summary="정규식+NER 통합 탐지",
-    description=(
-        "정규식과 NER을 선택적으로 실행하고, 정책에 따라 결과를 병합하여 반환\n"
-        "- options.run_regex / options.run_ner 로 각 탐지 실행 여부를 제어\n"
-        "- policy를 함께 전달하면 기본 정책 대신 해당 정책이 병합에 사용됨\n"
-        '- 테스트 예시: { \"text\": \"홍길동, 생일은 2004-01-01.소속 중부대학교. 주소는 경기도 고양시 덕양구 동헌로 305. 연락처 010-1234--5678.\", \"options\":  \"run_regex\": true, \"run_ner\": true } }'
-    ),
-)
+# /text/detect (정규식 + NER)
+@router.post("/detect")
 async def detect(req: dict):
     text = (req or {}).get("text", "") or ""
     options = (req or {}).get("options", {}) or {}
-    policy = (req or {}).get("policy") or {}
+    policy = _effective_policy((req or {}).get("policy") or {})
 
     run_regex_opt = bool(options.get("run_regex", True))
     run_ner_opt = bool(options.get("run_ner", True))
 
-    regex_result = match_text(text) if run_regex_opt else {"items": []}
+    # 1) 정규식 탐지
     regex_spans: List[Dict[str, Any]] = []
-    for it in regex_result.get("items", []):
-        s, e = it.get("start"), it.get("end")
-        if s is None or e is None or e <= s:
-            continue
-        label = it.get("label") or it.get("name") or "REGEX"
-        regex_spans.append(
-            {
-                "start": int(s),
-                "end": int(e),
-                "label": str(label),
-                "source": "regex",
-                "score": None,
-            }
-        )
+    if run_regex_opt:
+        regex_result = match_text(text)
+        for it in (regex_result.get("items", []) or []):
+            if it.get("valid") is False:
+                continue
+            s, e = it.get("start"), it.get("end")
+            if s is None or e is None:
+                continue
+            try:
+                s_i = int(s)
+                e_i = int(e)
+            except Exception:
+                continue
+            if e_i <= s_i:
+                continue
 
-    masked_text = text
-    if run_regex_opt and regex_spans:
-        chars = list(text)
-        for sp in regex_spans:
-            s = int(sp["start"])
-            e = int(sp["end"])
-            if s < 0:
-                s = 0
-            if e > len(chars):
-                e = len(chars)
-            for i in range(s, e):
-                if 0 <= i < len(chars) and chars[i] != "\n":
-                    chars[i] = " "
-        masked_text = "".join(chars)
-
-    ner_spans: List[Dict[str, Any]] = []
-    ner_raw_preview: Any = None
-    if run_ner_opt:
-        try:
-            from server.api.ner_api import ner_predict_blocking
-
-            raw_res = ner_predict_blocking(
-                masked_text, labels=policy.get("allowed_labels")
+            regex_spans.append(
+                {
+                    "start": s_i,
+                    "end": e_i,
+                    "label": it.get("label") or it.get("rule"),
+                    "text": text[s_i:e_i],
+                    "source": "regex",
+                    "score": None,
+                }
             )
-            ner_raw_preview = raw_res.get("raw")
-        except Exception:
-            ner_raw_preview = {"error": "ner_raw_preview_failed"}
-        from server.modules.ner_module import run_ner
 
-        ner_spans = run_ner(text=masked_text, policy=policy)
+    # 2) NER 탐지 (외부 마스킹 삭제, exclude_spans 전달)
+    ner_spans: List[Dict[str, Any]] = []
+    if run_ner_opt:
+        ner_spans = run_ner(text=text, policy=policy, exclude_spans=regex_spans)
+        for sp in ner_spans:
+            sp["source"] = "ner"
 
-    final_spans = regex_spans + ner_spans
-    final_spans.sort(key=lambda x: (x.get("start", 0), x.get("end", 0)))
-
-    filtered_spans: List[Dict[str, Any]] = []
-    used_ranges: List[tuple[int, int]] = []
-
-    for span in final_spans:
-        start = span.get("start", 0)
-        end = span.get("end", 0)
-        if end <= start:
+    # 3) 병합 + 필터링
+    final_spans: List[Dict[str, Any]] = []
+    for sp in (regex_spans + ner_spans):
+        # 정규식에서 잡힌 LC는 제거
+        if sp.get("source") == "regex" and sp.get("label") == "LC":
             continue
-        overlaps = any(
-            min(end, used_end) > max(start, used_start)
-            for used_start, used_end in used_ranges
-        )
-        if overlaps:
+        if not _is_valid_ner_span(sp):
             continue
-        filtered_spans.append(span)
-        used_ranges.append((start, end))
+        final_spans.append(sp)
 
-    report = {
-        "regex_input": len(regex_spans),
-        "ner_input": len(ner_spans),
-        "final_count": len(filtered_spans),
-        "degrade": not run_ner_opt,
-    }
+    final_spans.sort(key=lambda x: (x["start"], x["end"]))
 
     return {
         "text": text,
-        "final_spans": filtered_spans,
-        "report": report,
-        "debug": {
-            "run_regex": run_regex_opt,
-            "run_ner": run_ner_opt,
-            "ner_span_count": len(ner_spans),
-            "ner_span_head": ner_spans[:5],
-            "ner_raw_preview": ner_raw_preview,
+        "final_spans": final_spans,
+        "report": {
+            "regex": len(regex_spans),
+            "ner": len(ner_spans),
+            "final": len(final_spans),
         },
     }
 
-@router.post(
-    "/markdown",
-    summary="PDF에서 Markdown 텍스트 추출",
-    description="업로드한 PDF를 PyMuPDF4LLM으로 변환하여 Markdown 형태로 반환",
-)
-async def extract_markdown_endpoint(file: UploadFile) -> Dict[str, Any]:
+
+# /text/markdown
+@router.post("/markdown")
+async def extract_markdown_endpoint(file: UploadFile):
     filename = (file.filename or "").lower()
     if not filename.endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="현재 /text/markdown 엔드포인트는 PDF만 지원합니다.",
-        )
+        raise HTTPException(400, "PDF만 지원")
 
     pdf_bytes = await file.read()
-
-    try:
-        data = extract_pdf_markdown(pdf_bytes)
-    except Exception as e:
-        # 내부 오류를 그대로 노출하지 않도록 래핑
-        raise HTTPException(
-            status_code=500,
-            detail=f"Markdown 추출 중 오류: {e}",
-        )
-
-    # 그대로 JSON으로 반환
-    return data
+    data = extract_pdf_markdown(pdf_bytes)
+    return _normalize_newlines_in_obj(data)
