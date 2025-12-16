@@ -413,53 +413,19 @@ function joinBrokenLines(text) {
   return t
 }
 
-function normalizeNerItems(raw, srcText = '') {
+function normalizeNerItems(raw) {
   if (!raw) return { items: [] }
-  let arr = []
-  if (Array.isArray(raw.items)) arr = raw.items
-  else if (Array.isArray(raw.entities)) arr = raw.entities
-  else if (Array.isArray(raw.result?.entities)) arr = raw.result.entities
-  else if (Array.isArray(raw)) arr = raw
 
-  if (!arr.length && Array.isArray(raw.final_spans)) {
-    const spans = raw.final_spans.filter(
-      (s) => (s.source || '').toLowerCase() === 'ner'
-    )
-    arr = spans.map((s) => {
-      const start = Number(s.start ?? 0)
-      const end = Number(s.end ?? 0)
-      const text =
-        start >= 0 && end > start && srcText
-          ? srcText.slice(start, end)
-          : s.text || ''
-      return {
-        label: s.label || '',
-        text,
-        score: s.score ?? s.prob,
-        start,
-        end,
-      }
-    })
+  // 서버가 준 그대로
+  if (Array.isArray(raw.entities)) {
+    return { items: raw.entities }
   }
 
-  const map = (e) => ({
-    label: e.label ?? e.entity ?? e.tag ?? '',
-    text: e.text ?? e.word ?? e.value ?? '',
-    score:
-      typeof e.score === 'number'
-        ? e.score
-        : typeof e.confidence === 'number'
-        ? e.confidence
-        : undefined,
-    start: typeof e.start === 'number' ? e.start : 0,
-    end:
-      typeof e.end === 'number'
-        ? e.end
-        : typeof e.length === 'number'
-        ? (e.start || 0) + e.length
-        : 0,
-  })
-  return { items: arr.map(map) }
+  // (혹시 다른 형태로 올 경우에만 최소 호환)
+  if (Array.isArray(raw.items)) return { items: raw.items }
+  if (Array.isArray(raw)) return { items: raw }
+
+  return { items: [] }
 }
 
 async function requestNerSmart(text, exclude_spans) {
@@ -470,6 +436,7 @@ async function requestNerSmart(text, exclude_spans) {
     payload.exclude_spans = exclude_spans
 
   try {
+    // fetch()는 Promise를 반환하고 Response를 받는다. :contentReference[oaicite:1]{index=1}
     const r2 = await fetch(`${API_BASE()}/ner/predict`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -481,13 +448,23 @@ async function requestNerSmart(text, exclude_spans) {
       setStatus(`NER 분석 실패 (${r2.status})`)
       return { items: [] }
     }
+
+    // Response에서 JSON을 읽을 때 json()을 사용한다. :contentReference[oaicite:2]{index=2}
     const j2 = await r2.json()
-    return normalizeNerItems(j2, text || '')
+
+    // ✅ 프론트 계산 없이 서버 entities만 그대로
+    return normalizeNerItems(j2)
   } catch (e) {
     console.error('NER 요청 중 오류', e)
     setStatus(`NER 분석 중 오류: ${e.message || e}`)
     return { items: [] }
   }
+}
+
+function Score(v) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '-'
+  const t = Math.floor(v * 100) / 100
+  return t.toFixed(2)
 }
 
 function renderNerTable(ner) {
@@ -501,6 +478,7 @@ function renderNerTable(ner) {
   const items = (ner.items || []).filter((it) =>
     allow.has((it.label || '').toUpperCase())
   )
+
   if (rows) rows.innerHTML = ''
   for (const it of items) {
     const tr = document.createElement('tr')
@@ -508,12 +486,11 @@ function renderNerTable(ner) {
     tr.innerHTML = `
       <td class="py-2 px-2 font-mono">${esc(it.label)}</td>
       <td class="py-2 px-2 font-mono">${esc(it.text)}</td>
-      <td class="py-2 px-2 font-mono">${
-        typeof it.score === 'number' ? it.score.toFixed(2) : '-'
-      }</td>
+      <td class="py-2 px-2 font-mono">${Score(it.score)}</td>
       <td class="py-2 px-2 font-mono">${it.start}-${it.end}</td>`
     rows?.appendChild(tr)
   }
+
   badge('#ner-badge', items.length)
   if (sum) {
     const counts = {}
@@ -769,8 +746,11 @@ $('#btn-scan')?.addEventListener('click', async () => {
     } else {
       const excludeSpans = buildExcludeSpansFromMatch(matchData)
       const ner = await requestNerSmart(normalizedText, excludeSpans)
+
+      // ✅ UI는 서버 entities 그대로 출력
       renderNerTable(ner)
       renderNerDocStats(ner, normalizedText)
+
       $('#ner-metrics-block')?.classList.remove('hidden')
       ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
         $(sel)?.addEventListener('change', () => renderNerTable(ner))

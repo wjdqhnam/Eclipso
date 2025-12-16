@@ -197,10 +197,6 @@ def _normalize_pipeline_entities(
 
 
 def _merge_spans(spans: List[Dict[str, Any]], gap: int = 1) -> List[Dict[str, Any]]:
-    """
-    ✅ overlap chunk 때문에 생기는 중복/분절 엔터티 병합
-    - 같은 라벨이고 겹치거나 인접(gap)하면 합침
-    """
     if not spans:
         return []
     spans = sorted(spans, key=lambda x: (str(x.get("label", "")), int(x.get("start", 0)), int(x.get("end", 0))))
@@ -255,17 +251,14 @@ def run_ner(
         chars = list(text)
         n = len(chars)
         for sp in exclude_spans:
-            s = sp.get("start")
-            e = sp.get("end")
+            s = sp.get("start"); e = sp.get("end")
             if s is None or e is None:
                 continue
             try:
-                s = int(s)
-                e = int(e)
+                s = int(s); e = int(e)
             except Exception:
                 continue
-            s = max(0, min(n, s))
-            e = max(0, min(n, e))
+            s = max(0, min(n, s)); e = max(0, min(n, e))
             if e <= s:
                 continue
             for i in range(s, e):
@@ -289,6 +282,10 @@ def run_ner(
             spans.extend(chunk_spans)
         except Exception:
             continue
+
+    # overlap 청크 때문에 생기는 중복/분절 병합(핵심)
+    merge_gap = int(policy.get("merge_gap", 1))
+    spans = _merge_spans(spans, gap=merge_gap)
 
     spans.sort(key=lambda x: (x["start"], x["end"]))
     return spans
