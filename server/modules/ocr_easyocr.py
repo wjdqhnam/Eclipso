@@ -8,7 +8,6 @@ import numpy as np
 from PIL import Image
 import easyocr
 
-
 ImageLike = Union[str, bytes, np.ndarray, Image.Image]
 
 _reader: easyocr.Reader | None = None
@@ -18,9 +17,7 @@ def _get_reader(
     languages: list[str] | None = None,
     gpu: bool = False,
 ) -> easyocr.Reader:
-    """
-    EasyOCR Reader를 lazy-init 으로 하나만 유지.
-    """
+    # EasyOCR Reader lazy-init(1개 재사용)
     global _reader
 
     if _reader is None:
@@ -32,9 +29,7 @@ def _get_reader(
 
 
 def _image_to_ndarray(img: ImageLike) -> np.ndarray:
-    """
-    이미지 입력을 EasyOCR이 먹을 수 있는 numpy array로 변환.
-    """
+    # 입력 이미지를 numpy array로 변환
     if isinstance(img, np.ndarray):
         return img
 
@@ -57,23 +52,11 @@ def easyocr_blocks(
     min_conf: float = 0.3,
     gpu: bool = False,
 ) -> List[Dict[str, Any]]:
-    """
-    EasyOCR로 텍스트 + bbox + confidence 추출.
-
-    반환 형식:
-      [
-        {
-          "text": "9466-4480-0445-6876",
-          "bbox": [x0, y0, x1, y1],    # 픽셀 좌표
-          "conf": 0.92,
-        },
-        ...
-      ]
-    """
+    # OCR 결과를 text/bbox/conf 블록 리스트로 표준화
     reader = _get_reader(gpu=gpu)
     arr = _image_to_ndarray(img)
 
-    results = reader.readtext(arr, detail=1)  # (box, text, conf)
+    results = reader.readtext(arr, detail=1)
 
     blocks: List[Dict[str, Any]] = []
 
