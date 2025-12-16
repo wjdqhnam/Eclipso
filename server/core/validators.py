@@ -5,6 +5,55 @@ from datetime import datetime
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
+# 지역번호 형식 유효성 검증
+def is_valid_phone_city(number: str, options=None) -> bool:
+    if not number:
+        return False
+
+    # 하이픈 개수 제한
+    hyphen_cnt = number.count("-")
+    if hyphen_cnt not in (0, 2):
+        return False
+
+    d = _digits(number)
+
+    # 서울 (02)
+    if d.startswith("02"):
+        # 02-XXX-XXXX / 02-XXXX-XXXX
+        if hyphen_cnt == 2:
+            return bool(re.fullmatch(r"02-\d{3,4}-\d{4}", number))
+        # 021234567 / 0212345678
+        return len(d) in (9, 10)
+
+    # 기타 지역번호
+    if d[:3] in {f"0{x}" for x in range(31, 65)}:
+        if hyphen_cnt == 2:
+            return bool(re.fullmatch(r"0\d{2}-\d{3,4}-\d{4}", number))
+        return len(d) in (10, 11)
+
+    return False
+
+# 휴대폰 유효성 검증
+def is_valid_phone_mobile(number: str, options=None) -> bool:
+    if not number:
+        return False
+
+    hyphen_cnt = number.count("-")
+    if hyphen_cnt not in (0, 2):
+        return False
+
+    d = _digits(number)
+    if not d.startswith("010") or len(d) != 11:
+        return False
+
+    if hyphen_cnt == 2:
+        return bool(re.fullmatch(r"010-\d{3,4}-\d{4}", number))
+
+    # 하이픈 없는 경우
+    return True
+
+
+
 # 날짜 형식 유효성 검증
 def is_valid_date6(digits: str) -> bool:
     try:
@@ -153,21 +202,6 @@ def is_valid_card(number: str, options: dict | None = None) -> bool:
     if opts["luhn"] and not _luhn_ok(d):
         return False
     return True
-
-
-# 전화번호
-def is_valid_phone_mobile(number: str, options: dict | None = None) -> bool:
-    d = _digits(number)
-    return d.startswith("010") and len(d) == 11
-
-#지역번호
-def is_valid_phone_city(number: str, options: dict | None = None) -> bool:
-    d = _digits(number)
-    if d.startswith("02") and 9 <= len(d) <= 10:
-        return True
-    if d[:3] in {f"0{x}" for x in range(31 ,65)} and 10 <= len(d) <= 11:
-        return True
-    return False
 
 # 이메일
 def is_valid_email(addr: str, options: dict | None = None) -> bool:

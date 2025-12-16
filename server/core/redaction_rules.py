@@ -46,7 +46,7 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
 # 휴대폰
 MOBILE_RE = re.compile(r"01[016789]-?\d{3,4}-?\d{4}")
 
-# --- 지역번호 전화 ---
+# 지역번호 전화
 CITY_RE = re.compile(r"(?:02|0(?:3[1-3]|4[1-4]|5[1-5]|6[1-4]))-?\d{3,4}-?\d{4}")
 
 # 여권번호
@@ -101,7 +101,7 @@ RULES = {
 # --- 사전 정의된 패턴 ---
 PRESET_PATTERNS = [
     {"name": "rrn",            "regex": RRN_RE.pattern,        "case_sensitive": False, "whole_word": False},
-    {"name": "fgn",            "regex": FGN_RE.pattern,        "case_sensitive": False, "whole_word": False},  # ★ 추가
+    {"name": "fgn",            "regex": FGN_RE.pattern,        "case_sensitive": False, "whole_word": False},
     {"name": "email",          "regex": EMAIL_RE.pattern,      "case_sensitive": False, "whole_word": False},
     {"name": "phone_mobile",   "regex": MOBILE_RE.pattern,     "case_sensitive": False, "whole_word": False},
     {"name": "phone_city",     "regex": CITY_RE.pattern,       "case_sensitive": False, "whole_word": False},
