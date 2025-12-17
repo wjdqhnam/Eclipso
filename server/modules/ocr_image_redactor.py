@@ -1,61 +1,31 @@
 from __future__ import annotations
-import io, re, zipfile, logging, os
-from typing import List, Tuple, Optional, Dict, Any
 
-try:
-    from .common import (
-        cleanup_text, compile_rules, sub_text_nodes, chart_sanitize,
-        redact_embedded_xlsx_bytes, HWPX_DISABLE_CACHE
-    )
-except Exception:
-    from server.modules.common import (
-        cleanup_text, compile_rules, sub_text_nodes, chart_sanitize,
-        redact_embedded_xlsx_bytes, HWPX_DISABLE_CACHE
-    )
-
-try:
-    from ..core.schemas import XmlMatch, XmlLocation
-except Exception:
-    from server.core.schemas import XmlMatch, XmlLocation
-
-# OCR 추출/후처리
-try:
-    from .ocr_module import easyocr_blocks
-    from .ocr_qwen_post import classify_blocks_with_qwen
-except Exception:
-    from server.modules.ocr_module import easyocr_blocks
-    from server.modules.ocr_qwen_post import classify_blocks_with_qwen
+import io
+import os
+import re
+import logging
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from PIL import Image, ImageDraw, ImageOps, ImageFilter
 
-
-log = logging.getLogger("xml_redaction")
-if not log.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("[%(levelname)s] xml_redaction: %(message)s"))
-    log.addHandler(_h)
-log.setLevel(logging.INFO)
-
-_CURRENT_SECRETS: List[str] = []
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+try:
+    from server.modules.ocr_module import easyocr_blocks
+    from server.modules.ocr_qwen_post import classify_blocks_with_qwen
+except Exception:
+    from .ocr_module import easyocr_blocks
+    from .ocr_qwen_post import classify_blocks_with_qwen
 
 
-def set_hwpx_secrets(values: List[str] | None):
-    # OLE size-preserve 마스킹에서 쓰는 secrets 목록
-    global _CURRENT_SECRETS
-    _CURRENT_SECRETS = list(dict.fromkeys(v for v in (values or []) if v))
-
-
+# 환경변수 bool 파싱
 def _env_bool(key: str, default: bool) -> bool:
-    # env flag 읽기
     v = os.getenv(key)
     if v is None:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+# 환경변수 float 파싱
 def _env_float(key: str, default: float) -> float:
-    # env float 읽기
     v = os.getenv(key)
     if v is None:
         return default
@@ -65,8 +35,8 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+# compile_rules 결과(튜플/객체) 공통 순회
 def _iter_comp(comp):
-    # compile_rules 결과를 (rule, rx, need_valid, validator)로 통일
     for ent in comp:
         if isinstance(ent, (list, tuple)):
             rule = ent[0] if len(ent) > 0 else "unknown"
@@ -82,16 +52,16 @@ def _iter_comp(comp):
             yield rule, rx, need_valid, validator
 
 
+# 특정 룰 하나만 찾아서 (rx, need_valid, validator) 반환
 def _get_rule(comp, name: str):
-    # 특정 rule의 rx/validator 조회
     for rule, rx, need_valid, validator in _iter_comp(comp):
         if rule == name:
             return rx, need_valid, validator
     return None, True, None
 
 
+# validator 호출(시그니처 차이 대비)
 def _run_validator(value: str, validator) -> bool:
-    # validator 호출(시그니처 차이 허용)
     if not callable(validator):
         return True
     try:
@@ -106,25 +76,21 @@ def _run_validator(value: str, validator) -> bool:
 
 
 def _digits(s: str) -> str:
-    # 숫자만 추출
     return re.sub(r"\D+", "", s or "")
 
 
 def _image_fill_rgba(fill: str):
-    # 마스킹 색상(RGBA)
     f = (fill or "black").strip().lower()
     return (0, 0, 0, 255) if f == "black" else (255, 255, 255, 255)
 
 
 def _union_bbox(a, b):
-    # bbox union
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
     return (min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1))
 
 
-def _candidate_texts(text: str) -> List[str]:
-    # 룰 매칭용 후보 텍스트 변형 생성
+def _candidate_texts(text: str, extra: Optional[str] = None) -> List[str]:
     t0 = (text or "").strip()
     if not t0:
         return []
@@ -140,6 +106,8 @@ def _candidate_texts(text: str) -> List[str]:
         out.append(x)
 
     _add(t0)
+    if extra:
+        _add(extra)
 
     for sep in (":", "："):
         if sep in t0:
@@ -165,9 +133,14 @@ def _candidate_texts(text: str) -> List[str]:
     return out
 
 
-def _match_text_to_rules(text: str, comp, candidates: Optional[List[str]] = None):
-    # 텍스트를 룰(rx/validator)로 매칭
-    for t in _candidate_texts(text):
+# 후보 텍스트들을 룰(rx)로 매칭해서 (rule, value) 반환
+def _match_text_to_rules(
+    text: str,
+    comp,
+    candidates: Optional[List[str]] = None,
+    extra_candidate: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    for t in _candidate_texts(text, extra=extra_candidate):
         for rule, rx, need_valid, validator in _iter_comp(comp):
             if candidates is not None and rule not in candidates:
                 continue
@@ -182,28 +155,22 @@ def _match_text_to_rules(text: str, comp, candidates: Optional[List[str]] = None
             return rule, val
     return None, None
 
-
 def _block_bbox(b: Dict[str, Any]):
-    # block bbox 읽기
     bb = b.get("bbox") or [0, 0, 0, 0]
     x0, y0, x1, y1 = map(float, bb)
     return x0, y0, x1, y1
 
-
 def _y_center(b):
-    # bbox y center
     x0, y0, x1, y1 = _block_bbox(b)
     return (y0 + y1) * 0.5
 
-
 def _x_center(b):
-    # bbox x center
     x0, y0, x1, y1 = _block_bbox(b)
     return (x0 + x1) * 0.5
 
 
+# OCR block들을 y 기준으로 줄 단위로 그룹핑
 def _group_lines(blocks: List[Dict[str, Any]], y_tol: float = 10.0) -> List[List[Dict[str, Any]]]:
-    # OCR blocks를 라인 단위로 클러스터링
     if not blocks:
         return []
     blocks_sorted = sorted(blocks, key=lambda b: (_y_center(b), _x_center(b)))
@@ -224,13 +191,11 @@ def _group_lines(blocks: List[Dict[str, Any]], y_tol: float = 10.0) -> List[List
     return lines
 
 
+# 이메일이 토큰으로 쪼개진 경우(예: "abc" "@" "x.com") 한 줄에서 합치기
 def _merge_email_from_line_tokens(line: List[Dict[str, Any]], comp) -> List[Dict[str, Any]]:
-    # 라인 토큰을 합쳐 email synthetic block 생성
     rx, need_valid, validator = _get_rule(comp, "email")
     if rx is None:
         return []
-
-    merged: List[Dict[str, Any]] = []
 
     texts = [str(b.get("text") or "").strip() for b in line]
     if not any("@" in t for t in texts):
@@ -282,12 +247,15 @@ def _merge_email_from_line_tokens(line: List[Dict[str, Any]], comp) -> List[Dict
         x0, y0, x1, y1 = _block_bbox(b)
         bx0, by0, bx1, by1 = _union_bbox((bx0, by0, bx1, by1), (x0, y0, x1, y1))
 
-    merged.append({"text": best, "normalized": best, "bbox": [bx0, by0, bx1, by1]})
-    return merged
+    return [{"text": best, "normalized": best, "bbox": [bx0, by0, bx1, by1]}]
 
 
-def _merge_cards_from_digit_groups(lines: List[List[Dict[str, Any]]], comp, y_next_tol: float = 120.0) -> List[Dict[str, Any]]:
-    # 숫자 토큰을 합쳐 card synthetic block 생성(동일 라인/다음 라인)
+# 카드번호가 여러 토큰/여러 줄로 나뉜 경우 숫자 그룹을 합쳐서 후보 생성
+def _merge_cards_from_digit_groups(
+    lines: List[List[Dict[str, Any]]],
+    comp,
+    y_next_tol: float = 120.0,
+) -> List[Dict[str, Any]]:
     rx, need_valid, validator = _get_rule(comp, "card")
     if rx is None and validator is None:
         return []
@@ -305,7 +273,7 @@ def _merge_cards_from_digit_groups(lines: List[List[Dict[str, Any]]], comp, y_ne
 
     line_tokens: List[List[Tuple[Dict[str, Any], str]]] = []
     for line in lines:
-        toks = []
+        toks: List[Tuple[Dict[str, Any], str]] = []
         for b in line:
             t = str(b.get("text") or "").strip()
             d = _digits(t)
@@ -329,7 +297,7 @@ def _merge_cards_from_digit_groups(lines: List[List[Dict[str, Any]]], comp, y_ne
         chunks = [d for _, d in toks]
         for i in range(len(chunks)):
             for j in range(i + 1, min(len(chunks), i + 4)):
-                comb = chunks[i] + "".join(chunks[i + 1:j + 1])
+                comb = chunks[i] + "".join(chunks[i + 1: j + 1])
                 if _ok_card(comb):
                     bx0, by0, bx1, by1 = _block_bbox(toks[i][0])
                     for k in range(i + 1, j + 1):
@@ -368,8 +336,8 @@ def _merge_cards_from_digit_groups(lines: List[List[Dict[str, Any]]], comp, y_ne
     return out
 
 
+# bbox+text 기준으로 OCR 블록 중복 제거
 def _dedup_blocks(blocks: List[dict]) -> List[dict]:
-    # 좌표+텍스트 기준 중복 제거
     out: List[dict] = []
     for b in blocks:
         t = str(b.get("text") or "").strip()
@@ -397,6 +365,7 @@ def _dedup_blocks(blocks: List[dict]) -> List[dict]:
     return out
 
 
+# OCR 1회 실행(옵션에 따라 전처리/업스케일 적용)
 def _ocr_pass(
     img: Image.Image,
     min_conf: float,
@@ -405,7 +374,6 @@ def _ocr_pass(
     upscale: float = 1.0,
     sharpen: bool = False,
 ):
-    # OCR pass(전처리 옵션 포함)
     x = img
     if upscale and upscale > 1.01:
         w = int(x.width * upscale)
@@ -419,63 +387,53 @@ def _ocr_pass(
         x = x.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=2))
     return easyocr_blocks(x, min_conf=min_conf, gpu=gpu), (x.width / img.width, x.height / img.height)
 
-
 def _scale_bbox(bbox, sx: float, sy: float):
-    # 업스케일된 bbox를 원본 스케일로 환산
     x0, y0, x1, y1 = bbox
     return [x0 / sx, y0 / sy, x1 / sx, y1 / sy]
 
 
-def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tuple[bytes, int]:
-    # 이미지 OCR → 룰 매칭 → bbox 마스킹
-    ocr_use_llm = _env_bool("HWPX_OCR_USE_LLM", True)
-    ocr_debug = _env_bool("HWPX_OCR_DEBUG", False)
+# 이미지에서 OCR 후 민감정보 후보 블록들을 룰로 매칭하여 반환
+def detect_sensitive_ocr_blocks(
+    image: Image.Image,
+    *,
+    env_prefix: str = "DOCX",
+    filename: str = "",
+    logger: Optional[logging.Logger] = None,
+    comp=None,
+) -> List[Dict[str, Any]]:
+    if comp is None:
+        from server.modules.common import compile_rules
+        comp = compile_rules()
 
-    conf1 = _env_float("HWPX_OCR_MIN_CONF", 0.30)
-    conf2 = _env_float("HWPX_OCR_MIN_CONF2", 0.05)
-    conf3 = _env_float("HWPX_OCR_MIN_CONF3", 0.01)
+    log = logger or logging.getLogger("ocr_image_redactor")
 
-    pass2 = _env_bool("HWPX_OCR_SECOND_PASS", True)
-    pass3 = _env_bool("HWPX_OCR_UPSCALE_PASS", True)
-    upscale = _env_float("HWPX_OCR_UPSCALE", 2.0)
+    use_llm = _env_bool(f"{env_prefix}_OCR_LLM", _env_bool(f"{env_prefix}_OCR_USE_LLM", True))
+    debug = _env_bool(f"{env_prefix}_OCR_DEBUG", False)
 
-    ocr_fill = os.getenv("HWPX_OCR_FILL", "black") or "black"
+    conf1 = _env_float(f"{env_prefix}_OCR_MINCONF", 0.30)
+    conf2 = _env_float(f"{env_prefix}_OCR_MINCONF2", 0.05)
+    conf3 = _env_float(f"{env_prefix}_OCR_MINCONF3", 0.01)
 
-    pad_y = _env_float("HWPX_OCR_PAD_Y", 0.4)
-    pad_x_left = _env_float("HWPX_OCR_PAD_XL", 0.4)
-    pad_x_right = _env_float("HWPX_OCR_PAD_XR", 1.0)
+    pass2 = _env_bool(f"{env_prefix}_OCR_SECOND_PASS", True)
+    pass3 = _env_bool(f"{env_prefix}_OCR_UPSCALE_PASS", True)
+    upscale = _env_float(f"{env_prefix}_OCR_UPSCALE", 2.0)
 
-    line_y_tol = _env_float("HWPX_OCR_LINE_YTOL", 12.0)
-    card_nextline_tol = _env_float("HWPX_OCR_CARD_NEXTLINE_TOL", 140.0)
+    gpu = _env_bool(f"{env_prefix}_OCR_GPU", False)
 
-    try:
-        img0 = Image.open(io.BytesIO(image_bytes))
-        img0.load()
-    except Exception:
-        return image_bytes, 0
-
-    fmt = (img0.format or "").upper() or "PNG"
-    if fmt == "PNG":
-        img = img0.convert("RGBA") if img0.mode != "RGBA" else img0
-    else:
-        if img0.mode not in ("RGB", "RGBA"):
-            img = img0.convert("RGB")
-        elif img0.mode == "RGBA":
-            img = img0.convert("RGB")
-        else:
-            img = img0
+    line_y_tol = _env_float(f"{env_prefix}_OCR_LINE_YTOL", 12.0)
+    card_nextline_tol = _env_float(f"{env_prefix}_OCR_CARD_NEXTLINE_TOL", 140.0)
 
     blocks_all: List[Dict[str, Any]] = []
 
-    b1, (_sx1, _sy1) = _ocr_pass(img, conf1, gpu=False, autocontrast=False, upscale=1.0, sharpen=False)
+    b1, (_sx1, _sy1) = _ocr_pass(image, conf1, gpu=gpu, autocontrast=False, upscale=1.0, sharpen=False)
     blocks_all += b1
 
     if pass2:
-        b2, (_sx2, _sy2) = _ocr_pass(img, conf2, gpu=False, autocontrast=True, upscale=1.0, sharpen=True)
+        b2, (_sx2, _sy2) = _ocr_pass(image, conf2, gpu=gpu, autocontrast=True, upscale=1.0, sharpen=True)
         blocks_all += b2
 
     if pass3:
-        b3, (sx3, sy3) = _ocr_pass(img, conf3, gpu=False, autocontrast=True, upscale=upscale, sharpen=True)
+        b3, (sx3, sy3) = _ocr_pass(image, conf3, gpu=gpu, autocontrast=True, upscale=upscale, sharpen=True)
         for bb in b3:
             try:
                 x0, y0, x1, y1 = map(float, bb.get("bbox") or [0, 0, 0, 0])
@@ -485,13 +443,12 @@ def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tup
         blocks_all += b3
 
     blocks = _dedup_blocks(blocks_all)
-    if not blocks:
-        return image_bytes, 0
+    if debug:
+        print(f"[{env_prefix}] RAW OCR blocks=", len(blocks_all))
+        print(f"[{env_prefix}] OCR blocks=", len(blocks), "image=", filename)
 
-    if ocr_debug:
-        for b in blocks:
-            log.info("[HWPX][OCR][DBG] img=%s conf=%.3f text=%r bbox=%s",
-                filename, float(b.get("conf") or 0.0), str(b.get("text") or ""), b.get("bbox"))
+    if not blocks:
+        return []
 
     lines = _group_lines(blocks, y_tol=line_y_tol)
 
@@ -505,20 +462,21 @@ def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tup
         blocks.append(s)
 
     llm_blocks = blocks
-    if ocr_use_llm:
+    if use_llm:
         try:
             llm_blocks = classify_blocks_with_qwen(blocks)
         except Exception:
             llm_blocks = blocks
 
-    KIND_TO_RULES = {
+    # LLM 분류(kind) -> 룰 후보군 제한(없으면 전체 룰로 재시도)
+    kind_to_rules = {
         "email": ["email"],
         "phone": ["phone_mobile", "phone_city"],
         "card": ["card"],
         "id": ["rrn", "fgn", "passport", "driver_license"],
     }
 
-    matched_targets: List[dict] = []
+    matched: List[Dict[str, Any]] = []
 
     for b in llm_blocks:
         txt = str(b.get("normalized") or b.get("text") or "").strip()
@@ -526,7 +484,7 @@ def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tup
             continue
 
         llm_kind = (b.get("kind") or "none").strip().lower()
-        candidates = KIND_TO_RULES.get(llm_kind)
+        candidates = kind_to_rules.get(llm_kind)
 
         rule, val = _match_text_to_rules(txt, comp, candidates=candidates) if candidates else (None, None)
         if rule is None:
@@ -536,21 +494,104 @@ def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tup
             continue
 
         bb = dict(b)
-        bb["kind"] = rule
-        bb["normalized"] = val
-        matched_targets.append(bb)
+        bb["rule"] = rule
+        bb["value"] = val or txt
+        matched.append(bb)
 
-    if not matched_targets:
-        return image_bytes, 0
+    if debug:
+        counts: Dict[str, int] = {}
+        for m in matched:
+            r = m.get("rule") or "unknown"
+            counts[r] = counts.get(r, 0) + 1
+        print(f"[{env_prefix}] OCR matched rules=", counts)
+
+    return matched
+
+
+# 이미지 바이트를 받아 OCR로 민감정보 bbox를 마스킹하고 (bytes, hit) 또는 bytes 반환
+def redact_image_bytes(
+    image_bytes: bytes,
+    comp=None,
+    *,
+    filename: str = "",
+    env_prefix: str = "DOCX",
+    logger: Optional[logging.Logger] = None,
+    fill: str = "black",
+    use_llm: Optional[bool] = None,
+    min_conf: Optional[float] = None,
+    gpu: Optional[bool] = None,
+) -> Union[bytes, Tuple[bytes, int]]:
+    want_tuple = comp is not None or bool(filename) or logger is not None or env_prefix != "DOCX"
+    log = logger or logging.getLogger("ocr_image_redactor")
+
+    debug = _env_bool(f"{env_prefix}_OCR_DEBUG", False)
+
+    if use_llm is not None:
+        os.environ[f"{env_prefix}_OCR_USE_LLM"] = "1" if use_llm else "0"
+    if min_conf is not None:
+        os.environ[f"{env_prefix}_OCR_MINCONF"] = str(min_conf)
+    if gpu is not None:
+        os.environ[f"{env_prefix}_OCR_GPU"] = "1" if gpu else "0"
+
+    pad_y = _env_float(f"{env_prefix}_OCR_PAD_Y", 0.4)
+    pad_x_left = _env_float(f"{env_prefix}_OCR_PAD_XL", 0.4)
+    pad_x_right = _env_float(f"{env_prefix}_OCR_PAD_XR", 1.0)
+
+    if debug:
+        print(f"[{env_prefix}] OCR start image=", filename, "size=", len(image_bytes))
+
+    try:
+        img0 = Image.open(io.BytesIO(image_bytes))
+        img0.load()
+    except Exception as e:
+        if debug:
+            print(f"[{env_prefix}] OCR open failed image=", filename, "err=", repr(e))
+        return (image_bytes, 0) if want_tuple else image_bytes
+
+    fmt = (img0.format or "").upper() or "PNG"
+
+    if fmt == "PNG":
+        img = img0.convert("RGBA") if img0.mode != "RGBA" else img0
+    else:
+        if img0.mode not in ("RGB", "RGBA"):
+            img = img0.convert("RGB")
+        elif img0.mode == "RGBA":
+            img = img0.convert("RGB")
+        else:
+            img = img0
+
+    if comp is None:
+        from server.modules.common import compile_rules
+        comp = compile_rules()
+
+    matched = detect_sensitive_ocr_blocks(
+        img,
+        env_prefix=env_prefix,
+        filename=filename,
+        logger=log,
+        comp=comp,
+    )
+
+    if not matched:
+        if debug:
+            print(f"[{env_prefix}] OCR end image=", filename, "hits=0")
+        return (image_bytes, 0) if want_tuple else image_bytes
 
     draw = ImageDraw.Draw(img)
-    fill_rgba = _image_fill_rgba(ocr_fill)
+    fill_rgba = _image_fill_rgba(fill)
+    if img.mode == "RGB":
+        fill_rgba = fill_rgba[:3]
 
     hit = 0
-    for b in matched_targets:
+    rule_counts: Dict[str, int] = {}
+
+    for b in matched:
         try:
             x0, y0, x1, y1 = b.get("bbox", [0, 0, 0, 0])
-            x0 = float(x0); y0 = float(y0); x1 = float(x1); y1 = float(y1)
+            x0 = float(x0)
+            y0 = float(y0)
+            x1 = float(x1)
+            y1 = float(y1)
         except Exception:
             continue
 
@@ -565,16 +606,24 @@ def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tup
         draw.rectangle([x0, y0, x1, y1], fill=fill_rgba)
         hit += 1
 
-        log.info(
-            "[HWPX][OCR] img=%s kind=%s text=%r bbox=%s",
-            filename,
-            b.get("kind") or "none",
-            str(b.get("normalized") or b.get("text") or ""),
-            (x0, y0, x1, y1),
-        )
+        r = b.get("rule") or "unknown"
+        rule_counts[r] = rule_counts.get(r, 0) + 1
+
+        if debug:
+            print(
+                f"[{env_prefix}] OCR HIT",
+                "rule=",
+                r,
+                "text=",
+                repr(str(b.get("value") or b.get("text") or "")[:120]),
+                "bbox=",
+                b.get("bbox"),
+                "rect=",
+                (x0, y0, x1, y1),
+            )
 
     if hit <= 0:
-        return image_bytes, 0
+        return (image_bytes, 0) if want_tuple else image_bytes
 
     out = io.BytesIO()
     try:
@@ -585,220 +634,24 @@ def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str = "?") -> Tup
         else:
             img.save(out, format="PNG")
     except Exception:
-        return image_bytes, 0
+        return (image_bytes, 0) if want_tuple else image_bytes
 
-    return out.getvalue(), hit
+    red = out.getvalue()
 
+    if debug:
+        print(
+            f"[{env_prefix}] OCR end image=",
+            filename,
+            "in=",
+            len(image_bytes),
+            "out=",
+            len(red),
+            "changed=",
+            red != image_bytes,
+            "hit=",
+            hit,
+            "rules=",
+            rule_counts,
+        )
 
-def hwpx_text(zipf: zipfile.ZipFile) -> str:
-    # HWPX zip 내부 텍스트(본문/차트/임베디드) 수집
-    out: List[str] = []
-    names = zipf.namelist()
-
-    for name in sorted(n for n in names if n.lower().startswith("contents/") and n.endswith(".xml")):
-        try:
-            xml = zipf.read(name).decode("utf-8", "ignore")
-            out += [m.group(1) for m in re.finditer(r">([^<>]+)<", xml)]
-        except Exception:
-            pass
-
-    for name in sorted(n for n in names if (n.lower().startswith("chart/") or n.lower().startswith("charts/")) and n.endswith(".xml")):
-        try:
-            s = zipf.read(name).decode("utf-8", "ignore")
-            for m in re.finditer(r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>", s, re.I | re.DOTALL):
-                v = (m.group(1) or m.group(2) or "").strip()
-                if v:
-                    out.append(v)
-        except Exception:
-            pass
-
-    for name in names:
-        low = name.lower()
-        if not low.startswith("bindata/"):
-            continue
-        try:
-            b = zipf.read(name)
-        except KeyError:
-            continue
-
-        if len(b) >= 4 and b[:2] == b"PK":
-            try:
-                try:
-                    from .common import xlsx_text_from_zip
-                except Exception:
-                    from server.modules.common import xlsx_text_from_zip
-                with zipfile.ZipFile(io.BytesIO(b), "r") as ez:
-                    out.append(xlsx_text_from_zip(ez))
-            except Exception:
-                pass
-
-    return cleanup_text("\n".join(x for x in out if x))
-
-
-def extract_text(file_bytes: bytes) -> dict:
-    # /text/extract용 텍스트 정리
-    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
-        raw = hwpx_text(zipf)
-
-    txt = re.sub(r"<[^>\n]+>", "", raw)
-
-    lines = []
-    for line in txt.splitlines():
-        if re.fullmatch(r"\(?\^\d+[\).\s]*", line.strip()):
-            continue
-        lines.append(line)
-    txt = "\n".join(lines)
-    txt = re.sub(r"\(\^\d+\)", "", txt)
-    txt = re.sub(r"Sheet\d*!\$[A-Z]+\$\d+(?::\$[A-Z]+\$\d+)?", "", txt, flags=re.IGNORECASE)
-    txt = re.sub(r"General(?=\s*\d)", "", txt, flags=re.IGNORECASE)
-
-    cleaned = cleanup_text(txt)
-    return {"full_text": cleaned, "pages": [{"page": 1, "text": cleaned}]}
-
-
-def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
-    # 룰 기반 민감정보 추출(scan)
-    text = hwpx_text(zipf)
-    comp = compile_rules()
-
-    try:
-        from ..core.redaction_rules import RULES
-    except Exception:
-        from server.core.redaction_rules import RULES
-
-    def _validator(rule):
-        try:
-            v = RULES.get(rule, {}).get("validator")
-            return v if callable(v) else None
-        except Exception:
-            return None
-
-    out: List[XmlMatch] = []
-
-    for ent in comp:
-        try:
-            if isinstance(ent, (list, tuple)):
-                rule, rx = ent[0], ent[1]
-                need_valid = bool(ent[2]) if len(ent) >= 3 else True
-            else:
-                rule = getattr(ent, "name", getattr(ent, "rule", "unknown"))
-                rx = getattr(ent, "rx", None)
-                need_valid = bool(getattr(ent, "need_valid", True))
-            if rx is None:
-                continue
-        except Exception:
-            continue
-
-        vfunc = _validator(rule)
-
-        for m in rx.finditer(text):
-            val = m.group(0)
-            ok = True
-            if need_valid and vfunc:
-                try:
-                    ok = bool(vfunc(val))
-                except Exception:
-                    ok = False
-
-            out.append(
-                XmlMatch(
-                    rule=rule, value=val, valid=ok,
-                    context=text[max(0, m.start()-20): m.end()+20],
-                    location=XmlLocation(kind="hwpx", part="*merged_text*", start=m.start(), end=m.end()),
-                )
-            )
-
-    return out, "hwpx", text
-
-
-def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
-    # HWPX zip entry 단위 레닥션
-    low = filename.lower()
-    log.info("[HWPX][RED] entry=%s size=%d", filename, len(data))
-
-    if low.startswith("preview/"):
-        if low.endswith(IMAGE_EXTS):
-            log.info("[HWPX][IMG] preview image=%s size=%d", filename, len(data))
-        return b""
-
-    if HWPX_DISABLE_CACHE and low.endswith("settings.xml"):
-        try:
-            txt = data.decode("utf-8", "ignore")
-            txt = re.sub(r'(?i)usepreview\s*=\s*"(?:true|1)"', 'usePreview="false"', txt)
-            txt = re.sub(r"(?is)<preview>.*?</preview>", "<preview>0</preview>", txt)
-            txt = re.sub(r"(?is)<cache>.*?</cache>", "<cache>0</cache>", txt)
-            return txt.encode("utf-8", "ignore")
-        except Exception:
-            return data
-
-    if low.startswith("contents/") and low.endswith(".xml"):
-        return sub_text_nodes(data, comp)[0]
-
-    if (low.startswith("chart/") or low.startswith("charts/")) and low.endswith(".xml"):
-        b2, _ = chart_sanitize(data, comp)
-        return sub_text_nodes(b2, comp)[0]
-
-    ocr_on = _env_bool("HWPX_OCR_IMAGES", True)
-
-    if low.startswith("images/") or low.startswith("image/"):
-        if low.endswith(IMAGE_EXTS):
-            log.info("[HWPX][IMG] image=%s size=%d", filename, len(data))
-            if ocr_on:
-                red, hit = _redact_image_bytes(data, comp, filename=filename)
-                if hit > 0:
-                    log.info("[HWPX][IMG][OCR] redacted=%s hits=%d", filename, hit)
-                    return red
-        return data
-
-    if low.startswith("bindata/"):
-        log.info("[HWPX][BIN] bindata entry=%s size=%d", filename, len(data))
-
-        if low.endswith(IMAGE_EXTS):
-            log.info("[HWPX][IMG] bindata image=%s size=%d", filename, len(data))
-            if ocr_on:
-                red, hit = _redact_image_bytes(data, comp, filename=filename)
-                if hit > 0:
-                    log.info("[HWPX][IMG][OCR] redacted=%s hits=%d", filename, hit)
-                    return red
-            return data
-
-        if data[:2] == b"PK":
-            try:
-                return redact_embedded_xlsx_bytes(data)
-            except Exception:
-                return data
-
-        try:
-            try:
-                from .ole_redactor import redact_ole_bin_preserve_size
-            except Exception:
-                from server.modules.ole_redactor import redact_ole_bin_preserve_size
-            return redact_ole_bin_preserve_size(data, _CURRENT_SECRETS, mask_preview=True)
-        except Exception:
-            return data
-
-    if low.endswith(".xml") and not low.startswith("preview/"):
-        return sub_text_nodes(data, comp)[0]
-
-    return None
-
-
-def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
-    # 디버그/분석용 이미지 추출
-    out: List[Tuple[str, bytes]] = []
-    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as z:
-        for name in z.namelist():
-            low = name.lower()
-            if not (
-                low.startswith("preview/") or
-                low.startswith("images/") or
-                low.startswith("image/") or
-                low.startswith("bindata/")
-            ):
-                continue
-            if low.endswith(IMAGE_EXTS):
-                try:
-                    out.append((name, z.read(name)))
-                except KeyError:
-                    pass
-    return out
+    return (red, hit) if want_tuple else red
