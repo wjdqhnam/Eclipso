@@ -214,29 +214,6 @@ def _mask_markdown_noise_keep_len(text: str) -> str:
     return text.translate(trans)
 
 
-def _mask_hangul_suffix_digits_keep_len(text: str) -> str:
-    if not text:
-        return text
-
-    chars = list(text)
-    n = len(chars)
-
-    def is_hangul(ch: str) -> bool:
-        return "가" <= ch <= "힣"
-
-    def is_digit(ch: str) -> bool:
-        return "0" <= ch <= "9"
-
-    for i, ch in enumerate(chars):
-        if not is_digit(ch):
-            continue
-        prev = chars[i - 1] if i > 0 else ""
-        nxt = chars[i + 1] if i + 1 < n else ""
-        if is_hangul(prev) and (nxt == "" or nxt in [" ", "|", "\n", "\t", "\r"]):
-            chars[i] = " "
-    return "".join(chars)
-
-
 def _merge_entities(ents: List[Dict[str, Any]], merge_gap: int) -> List[Dict[str, Any]]:
     if not ents:
         return []
@@ -368,7 +345,7 @@ def _postprocess_split_ps(text: str, ents: List[Dict[str, Any]]) -> List[Dict[st
             continue
 
         for m in hits:
-            tok = seg[m.start():m.end()]
+            tok = seg[m.start() : m.end()]
             if is_noise(tok):
                 continue
             out.append({"label": "PS", "start": s + m.start(), "end": s + m.end(), "score": sc})
@@ -461,7 +438,7 @@ def _infer_entities_no_text(
     ranges = _coerce_ranges(exclude_spans, n) if exclude_spans else []
     masked = _mask_text(text, ranges) if ranges else text
     ner_input = _mask_markdown_noise_keep_len(masked) if NER_MASK_MARKDOWN else masked
-    ner_input = _mask_hangul_suffix_digits_keep_len(ner_input)
+
     _log_ner_input_text(ner_input)
 
     o_id: Optional[int] = None
@@ -469,7 +446,7 @@ def _infer_entities_no_text(
         o_id = label2id.get("O")
     elif "LABEL_0" in label2id:
         o_id = label2id.get("LABEL_0")
- 
+
     def _id_to_label(i: int) -> str:
         v = id2label.get(int(i))
         return str(v) if v is not None else str(i)
