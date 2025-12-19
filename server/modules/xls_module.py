@@ -426,6 +426,12 @@ def patch_positions(wb: bytearray, positions: List[int], start: int, new_bytes: 
     for i, b in enumerate(new_bytes):
         wb[positions[start + i]] = b
 
+def replace_fn(img_bytes, meta):
+    print("[DBG] 이미지 길이:", len(img_bytes))
+    print("[DBG]] BLIP 타입:", hex(meta["blipType"]))
+    return img_bytes
+
+
 
 # MSODRAWINGGROUP(0x00EB) 안의 BStore에서 BLIPFileData를 추출
 def parse_images(wb: bytearray, replace_fn=None) -> Dict[str, Any]:
@@ -576,6 +582,10 @@ def parse_images(wb: bytearray, replace_fn=None) -> Dict[str, Any]:
 
                 patch_positions(wb, pos, filedata_start, new_bytes)
                 patched += 1
+
+            print("[DBG] BLIP 헤더:", blip_bytes[:8].hex())
+            with open(f"debug_img_{images}.bin", "wb") as f:
+                f.write(blip_bytes)
 
     return {
         "found": True,
@@ -740,8 +750,8 @@ def redact(file_bytes: bytes) -> bytes:
     print("[OK] 헤더/푸터 텍스트 레닥션 완료")
 
     # 이미지 처리
-    img = parse_images(wb, replace_fn=None)
-    print(f"[OK] 이미지 추출: {img}")
+    img = parse_images(wb, replace_fn=replace_fn)
+    print(f"[OK] 이미지 위치: {img}")
 
     return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))
 
