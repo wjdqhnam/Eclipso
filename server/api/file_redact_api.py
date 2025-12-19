@@ -240,10 +240,160 @@ async def redact_file(
             out = _call_apply_text_redaction(file_bytes, enriched)
             mime = "application/pdf"
 
-        elif ext in (".doc", ".hwp", ".ppt", ".xls"):
+        elif ext == ".hwp":
+            # HWP는 NER spans를 지원 (start-end)
+            plain_text = hwp_module.extract_text(file_bytes).get("full_text") or ""
+            if not plain_text.strip():
+                raise HTTPException(400, "HWP plain text가 비어 있습니다.")
+
+            print(f"[HWP][DEBUG] plain_len={len(plain_text)} ner_allowed={ner_allowed}")
+
+            # 1) 정규식 탐지 (plain text 기준)
+            regex_result = match_text(plain_text)
+            items = list(regex_result.get("items", []) or [])
+
+            if isinstance(rules, list) and rules:
+                allowed_lower: Set[str] = {str(x).strip().lower() for x in rules}
+                items = [
+                    it
+                    for it in items
+                    if str(it.get("rule") or it.get("name") or "").strip().lower() in allowed_lower
+                ]
+
+            regex_spans: List[Dict[str, Any]] = []
+            for it in items:
+                rule_name = str(it.get("rule") or it.get("name") or "")
+                if it.get("valid") is False and not _is_email_rule(rule_name):
+                    continue
+                s, e = it.get("start"), it.get("end")
+                if s is None or e is None:
+                    continue
+                s, e = int(s), int(e)
+                if e > s:
+                    regex_spans.append(
+                        {
+                            "start": s,
+                            "end": e,
+                            "label": it.get("label") or rule_name or "REGEX",
+                            "source": "regex",
+                            "score": None,
+                        }
+                    )
+
+            # 2) NER는 /ner/predict 기준으로만 생성
+            ner_spans: List[Dict[str, Any]] = []
+            allowed_set: Optional[Set[str]] = None
+            if ner_allowed:
+                allowed_set = {str(x).upper() for x in ner_allowed}
+
+            if client_entities is not None:
+                # UI가 /ner/predict entities를 보내면 그 결과를 그대로 사용
+                for ent in client_entities:
+                    if not isinstance(ent, dict):
+                        continue
+                    lab = str(ent.get("label") or "").upper()
+                    s = ent.get("start")
+                    e = ent.get("end")
+                    if s is None or e is None:
+                        continue
+                    try:
+                        s = int(s)
+                        e = int(e)
+                    except Exception:
+                        continue
+                    if e <= s:
+                        continue
+                    if allowed_set is not None and lab and lab not in allowed_set:
+                        continue
+
+                    ner_spans.append(
+                        {
+                            "start": s,
+                            "end": e,
+                            "label": lab or "NER",
+                            "source": "ner",
+                            "score": ent.get("score", None),
+                        }
+                    )
+
+                print(f"[HWP][DEBUG] using client ner_entities={len(ner_spans)}")
+
+            else:
+                # UI가 entities를 안 보내도, 서버에서 /ner/predict와 동일하게 생성
+                from server.api.ner_api import ner_predict_local, _auto_exclude_spans_by_regex
+
+                exclude_spans = _auto_exclude_spans_by_regex(plain_text)
+                labels = [str(x) for x in ner_allowed] if isinstance(ner_allowed, list) else None
+
+                ents = ner_predict_local(
+                    text=plain_text,
+                    labels=labels,
+                    exclude_spans=exclude_spans,
+                )
+
+                n = len(plain_text)
+                for e in ents:
+                    try:
+                        s = max(0, min(n, int(e.get("start"))))
+                        ed = max(0, min(n, int(e.get("end"))))
+                    except Exception:
+                        continue
+                    if ed <= s:
+                        continue
+
+                    lab = str(e.get("label") or e.get("entity_group") or e.get("entity") or "").upper()
+                    if allowed_set is not None and lab and lab not in allowed_set:
+                        continue
+
+                    ner_spans.append(
+                        {
+                            "start": s,
+                            "end": ed,
+                            "label": lab or "NER",
+                            "source": "ner",
+                            "score": e.get("score", None),
+                        }
+                    )
+
+                print(f"[HWP][DEBUG] server-side /ner/predict aligned ner_entities={len(ner_spans)}")
+
+            # 3) regex 우선 병합 (겹치면 regex가 이김)
+            used_ranges: List[Tuple[int, int]] = [(sp["start"], sp["end"]) for sp in regex_spans]
+
+            ner_final: List[Dict[str, Any]] = []
+            for sp in ner_spans:
+                s, e = int(sp["start"]), int(sp["end"])
+                if s < 0 or e <= s:
+                    continue
+                if any(min(e, ue) > max(s, us) for us, ue in used_ranges):
+                    continue
+                ner_final.append(sp)
+                used_ranges.append((s, e))
+
+            final_spans = regex_spans + ner_final
+            final_spans.sort(key=lambda x: (int(x["start"]), int(x["end"])))
+
+            # 4) text 채우기
+            enriched: List[Dict[str, Any]] = []
+            for sp in final_spans:
+                s, e = int(sp["start"]), int(sp["end"])
+                if e <= s or s >= len(plain_text):
+                    continue
+                s = max(0, s)
+                e = min(len(plain_text), e)
+                text = plain_text[s:e]
+                if text.strip() == "":
+                    continue
+                enriched.append({**sp, "start": s, "end": e, "text": text})
+
+            print(f"[HWP][DEBUG] enriched_spans={len(enriched)} sample={enriched[:3]}")
+
+            out = hwp_module.redact(file_bytes, spans=enriched)
+            mime = "application/x-hwp"
+
+        elif ext in (".doc", ".ppt", ".xls"):
             module_map = {
                 ".doc": doc_module,
-                ".hwp": hwp_module,
                 ".ppt": ppt_module,
                 ".xls": xls_module,
             }

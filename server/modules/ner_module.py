@@ -23,7 +23,6 @@ def _chunk_text(
     while i < n:
         j = min(n, i + chunk_size)
 
-        # 가능한 경우 단어/줄 경계를 기준으로 쪼갬(문맥 유지)
         if j < n:
             back = text.rfind("\n", i, j)
             if back != -1 and (j - back) <= 80:
@@ -78,10 +77,6 @@ _MD_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
 
 
 def _mask_markdown_keep_len(text: str) -> str:
-    """
-    마크다운 테이블/구분선/헤더 구분선을 길이 유지 방식으로 무력화한다.
-    (오프셋 안정성 유지 목적)
-    """
     if not isinstance(text, str) or not text:
         return text
 
@@ -214,7 +209,11 @@ def _merge_spans(spans: List[Dict[str, Any]], gap: int = 0) -> List[Dict[str, An
         if s <= last_e:
             last["end"] = max(last_e, e)
             try:
-                last["score"] = max(float(last.get("score") or 0.0), float(sp.get("score") or 0.0))
+                last_len = max(1, int(last_e) - int(last_s))
+                sp_len   = max(1, int(e) - int(s))
+                s1 = float(last.get("score") or 0.0)
+                s2 = float(sp.get("score") or 0.0)
+                last["score"] = (s1 * last_len + s2 * sp_len) / (last_len + sp_len)
             except Exception:
                 pass
             continue
@@ -222,7 +221,11 @@ def _merge_spans(spans: List[Dict[str, Any]], gap: int = 0) -> List[Dict[str, An
         if gap > 0 and s <= last_e + gap:
             last["end"] = max(last_e, e)
             try:
-                last["score"] = max(float(last.get("score") or 0.0), float(sp.get("score") or 0.0))
+                last_len = max(1, int(last_e) - int(last_s))
+                sp_len   = max(1, int(e) - int(s))
+                s1 = float(last.get("score") or 0.0)
+                s2 = float(sp.get("score") or 0.0)
+                last["score"] = (s1 * last_len + s2 * sp_len) / (last_len + sp_len)
             except Exception:
                 pass
             continue

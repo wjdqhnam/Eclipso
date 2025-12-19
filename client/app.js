@@ -503,110 +503,6 @@ function renderNerTable(ner) {
   }
 }
 
-function renderNerDocStats(ner, srcText = '') {
-  const out = $('#ner-metrics-output')
-  if (!out) return
-
-  const items = Array.isArray(ner?.items) ? ner.items : []
-  const total = items.length
-
-  const byLabel = {}
-  for (const it of items) {
-    const lab = String(it.label || '').toUpperCase()
-    if (!lab) continue
-    byLabel[lab] = (byLabel[lab] || 0) + 1
-  }
-
-  const ranges = []
-  for (const it of items) {
-    const s = Number(it.start ?? 0)
-    const e = Number(it.end ?? 0)
-    if (!(e > s)) continue
-    ranges.push([s, e])
-  }
-  ranges.sort((a, b) => a[0] - b[0])
-  const merged = []
-  for (const [s, e] of ranges) {
-    if (!merged.length || s > merged[merged.length - 1][1]) merged.push([s, e])
-    else
-      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e)
-  }
-  let covered = 0
-  for (const [s, e] of merged) covered += Math.max(0, e - s)
-  const textLen = (srcText || '').length || 1
-  const coverage = covered / textLen
-
-  const wanted = ['PS', 'LC', 'OG', 'DT']
-
-  let maxCount = 0
-  for (const lab of wanted) maxCount = Math.max(maxCount, byLabel[lab] || 0)
-  if (!maxCount) maxCount = 1
-
-  const labelRows = wanted
-    .map((lab) => {
-      const cnt = byLabel[lab] || 0
-      const width = (cnt / maxCount) * 100
-      let colorHex = '#e5e7eb'
-      if (cnt > 0) {
-        if (lab === 'PS') colorHex = '#0ea5e9'
-        else if (lab === 'LC') colorHex = '#10b981'
-        else if (lab === 'OG') colorHex = '#f59e0b'
-        else if (lab === 'DT') colorHex = '#8b5cf6'
-      }
-      return `
-        <tr class="border-t border-gray-100">
-          <td class="px-2 py-1.5 text-[11px] font-medium text-gray-700">${lab}</td>
-          <td class="px-2 py-1.5 text-[11px] text-right text-gray-700">
-            <div class="w-full h-4 rounded-full bg-gray-100 overflow-hidden flex items-center justify-end pr-1">
-              <div class="h-4 rounded-full" style="width: ${width}%; background-color: ${colorHex};"></div>
-              <span class="ml-1 relative z-10 text-[11px] text-gray-800">${cnt}</span>
-            </div>
-          </td>
-        </tr>
-      `
-    })
-    .join('')
-
-  const coveragePct = (coverage * 100).toFixed(1)
-  const hasEntities = total > 0
-  const coverageBarStyle = hasEntities
-    ? 'background: linear-gradient(to right, #0ea5e9, #6366f1);'
-    : 'background-color: #e5e7eb;'
-
-  out.innerHTML = `
-    <div class="space-y-3">
-      <div class="flex items-center justify-between text-xs text-gray-700">
-        <div><span class="font-semibold">총 엔티티 수</span>: ${total}</div>
-      </div>
-
-      <div class="space-y-1">
-        <div class="flex items-center justify-between text-[11px] text-gray-500">
-          <span>문서 길이 대비 엔티티</span>
-          <span class="text-gray-700 font-medium">${coveragePct}%</span>
-        </div>
-        <div class="h-2 rounded-full bg-gray-100 overflow-hidden">
-          <div class="h-2" style="${coverageBarStyle} width: ${Math.min(
-    100,
-    coverage * 100
-  )}%;"></div>
-        </div>
-      </div>
-
-      <div class="overflow-x-auto border border-gray-100 rounded-lg">
-        <table class="min-w-full text-[11px]">
-          <thead class="bg-gray-50 text-gray-500">
-            <tr>
-              <th class="px-2 py-1.5 text-left font-medium">Label</th>
-              <th class="px-2 py-1.5 text-right font-medium">Count</th>
-            </tr>
-          </thead>
-          <tbody>${labelRows}</tbody>
-        </table>
-      </div>
-    </div>
-  `
-}
-
 function setStatus(msg) {
   const el = $('#status')
   if (el) el.textContent = msg || ''
@@ -741,7 +637,6 @@ $('#btn-scan')?.addEventListener('click', async () => {
     setStatus('NER 분석 중...')
     if (!normalizedText.trim()) {
       renderNerTable({ items: [] })
-      renderNerDocStats({ items: [] }, normalizedText)
       setOpen('ner', true)
       __lastNerEntities = []
     } else {
@@ -750,9 +645,6 @@ $('#btn-scan')?.addEventListener('click', async () => {
 
       __lastNerEntities = Array.isArray(ner?.items) ? ner.items : []
       renderNerTable(ner)
-      renderNerDocStats(ner, normalizedText)
-
-      $('#ner-metrics-block')?.classList.remove('hidden')
       ;['#ner-show-ps', '#ner-show-lc', '#ner-show-og'].forEach((sel) =>
         $(sel)?.addEventListener('change', () => renderNerTable(ner))
       )

@@ -45,6 +45,7 @@ NER_BATCH_SIZE = int(os.getenv("NER_BATCH_SIZE", "8"))
 
 NER_MERGE_GAP = int(os.getenv("NER_MERGE_GAP", "0"))
 NER_SCORE_THRESHOLD = float(os.getenv("NER_SCORE_THRESHOLD", "0.0"))
+NER_TEMPERATURE = float(os.getenv("NER_TEMPERATURE", "3.0"))
 
 NER_MASK_MARKDOWN = os.getenv("NER_MASK_MARKDOWN", "1") == "1"
 NER_LOG_MAX_CHARS = int(os.getenv("NER_LOG_MAX_CHARS", "20000"))
@@ -57,7 +58,6 @@ class NerAPIError(Exception):
 
 router = APIRouter(prefix="/ner", tags=["ner"])
 
-
 def _truncate(s: str, max_chars: int) -> str:
     if not isinstance(s, str):
         s = str(s)
@@ -65,12 +65,10 @@ def _truncate(s: str, max_chars: int) -> str:
         return s[:max_chars] + "\n...(truncated)"
     return s
 
-
 def _log_ner_input_text(ner_input: str) -> None:
     if not isinstance(ner_input, str):
         return
     logger.info("%s ner_input:\n%s", log_prefix, _truncate(ner_input, NER_LOG_MAX_CHARS))
-
 
 def _log_predict_result(payload: Dict[str, Any]) -> None:
     try:
@@ -79,7 +77,6 @@ def _log_predict_result(payload: Dict[str, Any]) -> None:
         s = str(payload)
     logger.info("%s predict_result:\n%s", log_prefix, _truncate(s, NER_LOG_MAX_CHARS))
 
-
 def _normalize_label(label: str) -> str:
     if not label:
         return label
@@ -87,10 +84,8 @@ def _normalize_label(label: str) -> str:
         return label[2:]
     return label
 
-
 def _overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
     return min(a[1], b[1]) - max(a[0], b[0]) > 0
-
 
 def _looks_like_email(v: str) -> bool:
     s = (v or "").strip()
@@ -98,7 +93,6 @@ def _looks_like_email(v: str) -> bool:
         return False
     dom = s.split("@", 1)[-1]
     return "." in dom and len(dom) >= 3
-
 
 def _auto_exclude_spans_by_regex(text: str) -> List[Dict[str, Any]]:
     if not match_text:
@@ -231,19 +225,32 @@ def _merge_entities(ents: List[Dict[str, Any]], merge_gap: int) -> List[Dict[str
             merged.append(e)
             continue
 
+        # 겹치거나 붙어있는 경우
         if e["start"] <= last["end"]:
-            last["end"] = max(last["end"], e["end"])
-            last["score"] = max(float(last.get("score", 0.0)), float(e.get("score", 0.0)))
+            last_len = max(1, int(last["end"]) - int(last["start"]))
+            e_len = max(1, int(e["end"]) - int(e["start"]))
+            s1 = float(last.get("score", 0.0))
+            s2 = float(e.get("score", 0.0))
+
+            last["end"] = max(int(last["end"]), int(e["end"]))
+            last["score"] = (s1 * last_len + s2 * e_len) / (last_len + e_len)
             continue
 
+        # gap 허용 병합 (여기도 max 말고 mean으로)
         if merge_gap > 0 and e["start"] <= last["end"] + merge_gap:
-            last["end"] = max(last["end"], e["end"])
-            last["score"] = max(float(last.get("score", 0.0)), float(e.get("score", 0.0)))
+            last_len = max(1, int(last["end"]) - int(last["start"]))
+            e_len = max(1, int(e["end"]) - int(e["start"]))
+            s1 = float(last.get("score", 0.0))
+            s2 = float(e.get("score", 0.0))
+
+            last["end"] = max(int(last["end"]), int(e["end"]))
+            last["score"] = (s1 * last_len + s2 * e_len) / (last_len + e_len)
             continue
 
         merged.append(e)
 
     return merged
+
 
 
 def _ensure_pad_token(tokenizer: Any, model: Any) -> None:
@@ -406,13 +413,19 @@ def _postprocess_merge_lc_parentheses(text: str, ents: List[Dict[str, Any]]) -> 
             new_end += 1
 
         a["end"] = new_end
-        a["score"] = float(max(float(a.get("score", 0.0)), float(b.get("score", 0.0))))
+        a_len = max(1, int(a_e) - int(a_s))
+        b_len = max(1, int(b_e) - int(b_s))
+        sa = float(a.get("score", 0.0))
+        sb = float(b.get("score", 0.0))
+        a["score"] = (sa * a_len + sb * b_len) / (a_len + b_len)
+
         out.append(a)
         i += 2
 
     out.sort(key=lambda x: (_safe_int(x.get("start"), 0), _safe_int(x.get("end"), 0)))
     return out
 
+logger.info("%s NER_TEMPERATURE=%s", log_prefix, NER_TEMPERATURE)
 
 def _infer_entities_no_text(
     text: str,
@@ -485,8 +498,11 @@ def _infer_entities_no_text(
 
             out = model(**batch)
             logits = out.logits
+            
+            #Temperature 적용 
+            T = max(1e-6, float(NER_TEMPERATURE))
+            probs = torch.softmax(logits / T, dim=-1)
 
-            probs = torch.softmax(logits, dim=-1)
             pred_ids = torch.argmax(probs, dim=-1)
             pred_scores = torch.max(probs, dim=-1).values
 

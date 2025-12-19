@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_POLICY: Dict[str, Any] = {
     "chunk_size": 1500,
     "chunk_overlap": 200,
-    "allowed_labels": ["PS", "LC", "OG", "DT"],
+    "allowed_labels": ["PS", "LC", "OG"],
 }
 
 def _effective_policy(user_policy: Any) -> Dict[str, Any]:
@@ -55,11 +55,6 @@ def _is_valid_span(span: Dict[str, Any]) -> bool:
 
 @router.post("/extract")
 async def extract_text(file: UploadFile):
-    """
-    PDF의 경우:
-    - full_text = extract_text_indexed(full_text)로 고정 (NER/정규식/레닥션 인덱스 정합)
-    - markdown은 UI 미리보기용
-    """
     try:
         filename = (file.filename or "").lower()
         raw_bytes = await file.read()

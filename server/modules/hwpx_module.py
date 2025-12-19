@@ -53,12 +53,6 @@ def set_hwpx_secrets(values: List[str] | None):
 
 # 텍스트 수집: 본문 XML, 차트 XML, 내장 XLSX(sharedStrings, worksheets, charts)
 def hwpx_text(zipf: zipfile.ZipFile) -> str:
-    """
-    HWPX(zip)에서 텍스트를 모아 하나의 문자열로 합친다.
-    - Contents/*.xml: 본문
-    - Chart(s)/*.xml: 차트 라벨/값
-    - BinData/*: 내장 XLSX 안의 텍스트
-    """
     out: List[str] = []
 
     names = zipf.namelist()
@@ -122,7 +116,6 @@ def extract_text(file_bytes: bytes) -> dict:
         raw = hwpx_text(zipf)
 
     # 1) 차트/내장 XLSX 에서 섞여 들어온 XML 태그 제거
-    #    예: "<c:v>계열 1" -> "계열 1"
     txt = re.sub(r"<[^>\n]+>", "", raw)
 
     # 2) HWP 각주/주석 마커 줄 제거: "^1.", "^2)", "(^3)" 등
@@ -139,7 +132,6 @@ def extract_text(file_bytes: bytes) -> dict:
     txt = re.sub(r"\(\^\d+\)", "", txt)
 
     # 3) 엑셀 시트/범위 토큰 제거
-    #    예: "Sheet1!$B$1", "Sheet1!$B$2:$B$5"
     txt = re.sub(
         r"Sheet\d*!\$[A-Z]+\$\d+(?::\$[A-Z]+\$\d+)?",
         "",
