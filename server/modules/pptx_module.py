@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import zipfile
 import logging
-from typing import List, Tuple
+import inspect
+from typing import List, Tuple, Optional
 
-# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
+# 공통 유틸 (상대 import 우선, 실패 시 절대 import)
 try:
     from .common import (
         cleanup_text,
@@ -16,8 +18,8 @@ try:
         xlsx_text_from_zip,
         redact_embedded_xlsx_bytes,
     )
-except Exception: 
-    from server.modules.common import ( 
+except Exception:
+    from server.modules.common import (
         cleanup_text,
         compile_rules,
         sub_text_nodes,
@@ -26,17 +28,203 @@ except Exception:
         redact_embedded_xlsx_bytes,
     )
 
-
 from server.core.schemas import XmlMatch, XmlLocation
 
 log = logging.getLogger("xml_redaction")
+
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
+# 이미지 OCR 레닥션 엔진(있으면 사용, 없으면 skip)
+try:
+    from .ocr_image_redactor import redact_image_bytes
+except Exception:
+    try:
+        from server.modules.ocr_image_redactor import redact_image_bytes
+    except Exception:
+        redact_image_bytes = None
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    # env flag 읽기
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _ensure_ocr_env_compat(env_prefix: str):
+    # 기존 키(HWPX_OCR_MIN_CONF 등)와 신규 키(PPTX_OCR_MINCONF 등) 혼용 대응
+    mapping = [
+        ("OCR_MINCONF", "OCR_MIN_CONF"),
+        ("OCR_MINCONF2", "OCR_MIN_CONF2"),
+        ("OCR_MINCONF3", "OCR_MIN_CONF3"),
+    ]
+    for new_tail, old_tail in mapping:
+        new_k = f"{env_prefix}_{new_tail}"
+        old_k = f"{env_prefix}_{old_tail}"
+        if os.getenv(new_k) is None and os.getenv(old_k) is not None:
+            os.environ[new_k] = os.getenv(old_k) or ""
+
+
+def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix: str, logger, debug: bool):
+    # redact_image_bytes 시그니처 차이(버전별) 흡수 + (bytes, hit) / bytes 반환 모두 처리
+    kwargs = {}
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+        def _set_kw(key: str, value):
+            if value is None:
+                return
+            if has_varkw or (key in params):
+                kwargs[key] = value
+
+        _set_kw("filename", filename)
+        _set_kw("name", filename)
+        _set_kw("path", filename)
+        _set_kw("env_prefix", env_prefix)
+        _set_kw("prefix", env_prefix)
+        _set_kw("env", env_prefix)
+        _set_kw("logger", logger)
+        _set_kw("log", logger)
+
+        if debug:
+            _set_kw("debug", True)
+            _set_kw("verbose", True)
+            _set_kw("trace", True)
+
+        comp_kw_name = None
+        for cand in ("comp", "compiled", "compiled_rules", "rules"):
+            if has_varkw or (cand in params):
+                comp_kw_name = cand
+                break
+
+        pos_params = [
+            p for p in params.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        pos_count = len(pos_params)
+
+    except Exception:
+        sig = None
+        has_varkw = False
+        comp_kw_name = None
+        pos_count = 0
+
+    last_err = None
+
+    def _normalize_ret(ret):
+        if isinstance(ret, tuple) and len(ret) == 2:
+            red, hit = ret
+            if isinstance(red, bytearray):
+                red = bytes(red)
+            if isinstance(red, bytes):
+                try:
+                    return red, int(hit)
+                except Exception:
+                    return red, -1
+            return None
+        if isinstance(ret, bytearray):
+            return bytes(ret), -1
+        if isinstance(ret, bytes):
+            return ret, -1
+        return None
+
+    # 1) (data, comp, **kwargs)
+    try:
+        if sig is None or has_varkw or pos_count >= 2:
+            ret = fn(data, comp, **kwargs)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 2) (data, **kwargs)
+    try:
+        ret = fn(data, **kwargs)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 3) (data)
+    try:
+        ret = fn(data)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 4) (data, comp=<...>/rules=<...>, **kwargs)
+    try:
+        if comp_kw_name is not None:
+            kw2 = dict(kwargs)
+            kw2[comp_kw_name] = comp
+            ret = fn(data, **kw2)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    raise TypeError(f"redact_image_bytes call failed: {last_err!r}")
+
+
+def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str) -> Tuple[bytes, int]:
+    # PPTX 이미지 → OCR 레닥션(가능한 경우만)
+    if redact_image_bytes is None:
+        log.warning("[PPTX][IMG][OCR] ocr_image_redactor not available -> skip (%s)", filename)
+        return image_bytes, 0
+
+    if not _env_bool("PPTX_OCR_IMAGES", True):
+        log.info("[PPTX][IMG][OCR] disabled by env (PPTX_OCR_IMAGES=0) image=%s", filename)
+        return image_bytes, 0
+
+    _ensure_ocr_env_compat("PPTX")
+
+    debug = _env_bool("PPTX_OCR_DEBUG", False)
+
+    try:
+        red, hit = _call_redact_image_bytes(
+            redact_image_bytes,
+            image_bytes,
+            comp,
+            filename=filename,
+            env_prefix="PPTX",
+            logger=log,
+            debug=debug,
+        )
+        changed = (red != image_bytes)
+        log.info(
+            "[PPTX][IMG][OCR] end image=%s in=%d out=%d changed=%s hit=%s",
+            filename,
+            len(image_bytes),
+            len(red),
+            changed,
+            hit,
+        )
+        return red, hit
+    except Exception as e:
+        log.exception("[PPTX][IMG][OCR] failed image=%s err=%r", filename, e)
+        return image_bytes, 0
 
 
 def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
+    # 차트 XML + 임베디드 XLSX 텍스트 수집
     parts: List[str] = []
 
-    # 1) 차트 XML 텍스트 수집
     for name in sorted(
         n for n in zipf.namelist()
         if n.startswith("ppt/charts/") and n.endswith(".xml")
@@ -51,14 +239,10 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
             s,
             re.IGNORECASE | re.DOTALL,
         ):
-            text_part = m.group(1)
-            num_part = m.group(2)
-            v = (text_part or num_part or "").strip()
-            if not v:
-                continue
-            parts.append(v)
+            v = (m.group(1) or m.group(2) or "").strip()
+            if v:
+                parts.append(v)
 
-    # 2) 임베디드 XLSX (차트 데이터 등)
     for name in sorted(
         n for n in zipf.namelist()
         if n.startswith("ppt/embeddings/") and n.lower().endswith(".xlsx")
@@ -78,6 +262,7 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
 
 
 def pptx_text(zipf: zipfile.ZipFile) -> str:
+    # 슬라이드 텍스트 + 차트/임베디드 텍스트 합치기
     all_txt: List[str] = []
 
     for name in sorted(
@@ -102,25 +287,15 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
     return cleanup_text("\n".join(all_txt))
 
 
-# ────────────────────────────────────────────────────
-# /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
-# ────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes) -> dict:
+    # /text/extract용
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         txt = pptx_text(zipf)
-
-    return {
-        "full_text": txt,
-        "pages": [
-            {"page": 1, "text": txt},
-        ],
-    }
+    return {"full_text": txt, "pages": [{"page": 1, "text": txt}]}
 
 
-# ────────────────────────────────────────────────────
-# 스캔: 정규식 규칙으로 텍스트에서 민감정보 후보를 추출
-# ────────────────────────────────────────────────────
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
+    # 룰 기반 스캔(텍스트만)
     text = pptx_text(zipf)
     comp = compile_rules()
     out: List[XmlMatch] = []
@@ -129,13 +304,7 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
         try:
             if isinstance(ent, (list, tuple)):
                 if len(ent) >= 5:
-                    rule_name, rx, need_valid, _prio, validator = (
-                        ent[0],
-                        ent[1],
-                        bool(ent[2]),
-                        ent[3],
-                        ent[4],
-                    )
+                    rule_name, rx, need_valid, _prio, validator = ent[0], ent[1], bool(ent[2]), ent[3], ent[4]
                 elif len(ent) >= 3:
                     rule_name, rx, need_valid = ent[0], ent[1], bool(ent[2])
                     validator = None
@@ -173,22 +342,15 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
                     value=val,
                     valid=ok,
                     context=text[max(0, m.start() - 20): min(len(text), m.end() + 20)],
-                    location=XmlLocation(
-                        kind="pptx",
-                        part="*merged_text*",
-                        start=m.start(),
-                        end=m.end(),
-                    ),
+                    location=XmlLocation(kind="pptx", part="*merged_text*", start=m.start(), end=m.end()),
                 )
             )
 
     return out, "pptx", text
 
 
-# ────────────────────────────────────────────────────
-# 파일 단위 레닥션: 슬라이드/차트/임베디드 XLSX 처리
-# ────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
+    # PPTX entry 단위 레닥션(슬라이드/차트/임베디드/이미지 OCR)
     low = filename.lower()
     log.info(
         "[PPTX][RED] filename=%s low=%s size=%d",
@@ -211,12 +373,19 @@ def redact_item(filename: str, data: bytes, comp):
 
     if low.startswith("ppt/media/") and low.endswith(IMAGE_EXTS):
         log.info("[PPTX][IMG] image=%s size=%d", filename, len(data))
+
+        red, hit = _redact_image_bytes(data, comp, filename=filename)
+        if hit > 0 and red != data:
+            log.info("[PPTX][IMG][OCR] redacted=%s hits=%d", filename, hit)
+            return red
+
         return data
 
     return data
 
 
 def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    # 디버그용 이미지 추출
     out: List[Tuple[str, bytes]] = []
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         names = zipf.namelist()

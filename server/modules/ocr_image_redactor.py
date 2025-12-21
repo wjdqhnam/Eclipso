@@ -16,7 +16,6 @@ except Exception:
     from .ocr_qwen_post import classify_blocks_with_qwen
 
 
-# 환경변수 bool 파싱
 def _env_bool(key: str, default: bool) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -24,7 +23,6 @@ def _env_bool(key: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-# 환경변수 float 파싱
 def _env_float(key: str, default: float) -> float:
     v = os.getenv(key)
     if v is None:
@@ -35,7 +33,6 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-# compile_rules 결과(튜플/객체) 공통 순회
 def _iter_comp(comp):
     for ent in comp:
         if isinstance(ent, (list, tuple)):
@@ -52,7 +49,6 @@ def _iter_comp(comp):
             yield rule, rx, need_valid, validator
 
 
-# 특정 룰 하나만 찾아서 (rx, need_valid, validator) 반환
 def _get_rule(comp, name: str):
     for rule, rx, need_valid, validator in _iter_comp(comp):
         if rule == name:
@@ -60,7 +56,6 @@ def _get_rule(comp, name: str):
     return None, True, None
 
 
-# validator 호출(시그니처 차이 대비)
 def _run_validator(value: str, validator) -> bool:
     if not callable(validator):
         return True
@@ -133,7 +128,6 @@ def _candidate_texts(text: str, extra: Optional[str] = None) -> List[str]:
     return out
 
 
-# 후보 텍스트들을 룰(rx)로 매칭해서 (rule, value) 반환
 def _match_text_to_rules(
     text: str,
     comp,
@@ -155,21 +149,23 @@ def _match_text_to_rules(
             return rule, val
     return None, None
 
+
 def _block_bbox(b: Dict[str, Any]):
     bb = b.get("bbox") or [0, 0, 0, 0]
     x0, y0, x1, y1 = map(float, bb)
     return x0, y0, x1, y1
 
+
 def _y_center(b):
     x0, y0, x1, y1 = _block_bbox(b)
     return (y0 + y1) * 0.5
+
 
 def _x_center(b):
     x0, y0, x1, y1 = _block_bbox(b)
     return (x0 + x1) * 0.5
 
 
-# OCR block들을 y 기준으로 줄 단위로 그룹핑
 def _group_lines(blocks: List[Dict[str, Any]], y_tol: float = 10.0) -> List[List[Dict[str, Any]]]:
     if not blocks:
         return []
@@ -191,7 +187,6 @@ def _group_lines(blocks: List[Dict[str, Any]], y_tol: float = 10.0) -> List[List
     return lines
 
 
-# 이메일이 토큰으로 쪼개진 경우(예: "abc" "@" "x.com") 한 줄에서 합치기
 def _merge_email_from_line_tokens(line: List[Dict[str, Any]], comp) -> List[Dict[str, Any]]:
     rx, need_valid, validator = _get_rule(comp, "email")
     if rx is None:
@@ -201,56 +196,45 @@ def _merge_email_from_line_tokens(line: List[Dict[str, Any]], comp) -> List[Dict
     if not any("@" in t for t in texts):
         return []
 
-    joined_all = "".join(t.replace(" ", "") for t in texts if t)
-    cand = [joined_all]
+    joined = ""
+    spans: List[Tuple[int, int]] = []
+    for t in texts:
+        t2 = (t or "").replace(" ", "")
+        s = len(joined)
+        joined += t2
+        e = len(joined)
+        spans.append((s, e))
 
-    for i, t in enumerate(texts):
-        if "@" not in t:
-            continue
-        for L in (1, 2, 3):
-            for R in (1, 2, 3):
-                s = "".join(texts[max(0, i - L): min(len(texts), i + R + 1)])
-                s = s.replace(" ", "")
-                cand.append(s)
-
-    best = None
-    for s in cand:
-        m = rx.search(s)
-        if not m:
-            continue
+    m = rx.search(joined)
+    if not m:
+        m2 = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", joined)
+        if not m2:
+            return []
+        val = m2.group(0)
+        if need_valid and not _run_validator(val, validator):
+            return []
+        ms, me = m2.start(), m2.end()
+    else:
         val = m.group(0)
         if need_valid and not _run_validator(val, validator):
+            return []
+        ms, me = m.start(), m.end()
+
+    hit_idxs: List[int] = []
+    for i, (s, e) in enumerate(spans):
+        if e <= ms or s >= me:
             continue
-        best = val
-        break
-
-    if not best:
-        m2 = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", joined_all)
-        if m2:
-            val = m2.group(0)
-            if (not need_valid) or _run_validator(val, validator):
-                best = val
-
-    if not best:
+        hit_idxs.append(i)
+    if not hit_idxs:
         return []
 
-    idx_at = None
-    for i, t in enumerate(texts):
-        if "@" in t:
-            idx_at = i
-            break
-    if idx_at is None:
-        return []
+    bx0, by0, bx1, by1 = _block_bbox(line[hit_idxs[0]])
+    for i in hit_idxs[1:]:
+        bx0, by0, bx1, by1 = _union_bbox((bx0, by0, bx1, by1), _block_bbox(line[i]))
 
-    bx0, by0, bx1, by1 = _block_bbox(line[idx_at])
-    for b in line[idx_at:]:
-        x0, y0, x1, y1 = _block_bbox(b)
-        bx0, by0, bx1, by1 = _union_bbox((bx0, by0, bx1, by1), (x0, y0, x1, y1))
-
-    return [{"text": best, "normalized": best, "bbox": [bx0, by0, bx1, by1]}]
+    return [{"text": val, "normalized": val, "bbox": [bx0, by0, bx1, by1]}]
 
 
-# 카드번호가 여러 토큰/여러 줄로 나뉜 경우 숫자 그룹을 합쳐서 후보 생성
 def _merge_cards_from_digit_groups(
     lines: List[List[Dict[str, Any]]],
     comp,
@@ -336,7 +320,6 @@ def _merge_cards_from_digit_groups(
     return out
 
 
-# bbox+text 기준으로 OCR 블록 중복 제거
 def _dedup_blocks(blocks: List[dict]) -> List[dict]:
     out: List[dict] = []
     for b in blocks:
@@ -365,7 +348,6 @@ def _dedup_blocks(blocks: List[dict]) -> List[dict]:
     return out
 
 
-# OCR 1회 실행(옵션에 따라 전처리/업스케일 적용)
 def _ocr_pass(
     img: Image.Image,
     min_conf: float,
@@ -387,12 +369,42 @@ def _ocr_pass(
         x = x.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=2))
     return easyocr_blocks(x, min_conf=min_conf, gpu=gpu), (x.width / img.width, x.height / img.height)
 
+
 def _scale_bbox(bbox, sx: float, sy: float):
     x0, y0, x1, y1 = bbox
     return [x0 / sx, y0 / sy, x1 / sx, y1 / sy]
 
 
-# 이미지에서 OCR 후 민감정보 후보 블록들을 룰로 매칭하여 반환
+def _shrink_bbox_by_substring(block_text: str, value: str, bbox):
+    t = (block_text or "").replace(" ", "")
+    v = (value or "").replace(" ", "")
+    if not t or not v:
+        return bbox
+
+    idx = t.find(v)
+    if idx < 0:
+        return bbox
+
+    try:
+        x0, y0, x1, y1 = map(float, bbox)
+    except Exception:
+        return bbox
+
+    w = max(1.0, x1 - x0)
+    L = max(1, len(t))
+
+    start_ratio = idx / L
+    end_ratio = (idx + len(v)) / L
+
+    nx0 = x0 + w * start_ratio
+    nx1 = x0 + w * end_ratio
+
+    if nx1 - nx0 < 1.0:
+        return bbox
+
+    return [nx0, y0, nx1, y1]
+
+
 def detect_sensitive_ocr_blocks(
     image: Image.Image,
     *,
@@ -418,7 +430,7 @@ def detect_sensitive_ocr_blocks(
     pass3 = _env_bool(f"{env_prefix}_OCR_UPSCALE_PASS", True)
     upscale = _env_float(f"{env_prefix}_OCR_UPSCALE", 2.0)
 
-    gpu = _env_bool(f"{env_prefix}_OCR_GPU", False)
+    gpu = _env_bool(f"{env_prefix}_OCR_GPU", False)  # gpu 사용여부 결정
 
     line_y_tol = _env_float(f"{env_prefix}_OCR_LINE_YTOL", 12.0)
     card_nextline_tol = _env_float(f"{env_prefix}_OCR_CARD_NEXTLINE_TOL", 140.0)
@@ -468,7 +480,6 @@ def detect_sensitive_ocr_blocks(
         except Exception:
             llm_blocks = blocks
 
-    # LLM 분류(kind) -> 룰 후보군 제한(없으면 전체 룰로 재시도)
     kind_to_rules = {
         "email": ["email"],
         "phone": ["phone_mobile", "phone_city"],
@@ -508,7 +519,6 @@ def detect_sensitive_ocr_blocks(
     return matched
 
 
-# 이미지 바이트를 받아 OCR로 민감정보 bbox를 마스킹하고 (bytes, hit) 또는 bytes 반환
 def redact_image_bytes(
     image_bytes: bytes,
     comp=None,
@@ -586,8 +596,14 @@ def redact_image_bytes(
     rule_counts: Dict[str, int] = {}
 
     for b in matched:
+        bbox0 = b.get("bbox", [0, 0, 0, 0])
+        txt_full = str(b.get("normalized") or b.get("text") or "")
+        val = str(b.get("value") or "")
+
+        bbox = _shrink_bbox_by_substring(txt_full, val, bbox0)
+
         try:
-            x0, y0, x1, y1 = b.get("bbox", [0, 0, 0, 0])
+            x0, y0, x1, y1 = bbox
             x0 = float(x0)
             y0 = float(y0)
             x1 = float(x1)
@@ -615,9 +631,9 @@ def redact_image_bytes(
                 "rule=",
                 r,
                 "text=",
-                repr(str(b.get("value") or b.get("text") or "")[:120]),
+                repr(val[:120] if val else str(b.get("text") or "")[:120]),
                 "bbox=",
-                b.get("bbox"),
+                bbox0,
                 "rect=",
                 (x0, y0, x1, y1),
             )
