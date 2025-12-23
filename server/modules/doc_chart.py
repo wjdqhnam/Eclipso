@@ -1,13 +1,17 @@
 import io, os, struct, tempfile, olefile
 from typing import Optional, List, Tuple
+
 from server.core.normalize import normalization_text
 from server.core.matching import find_sensitive_spans
+
 
 def le16(b, off):
     return struct.unpack_from("<H", b, off)[0]
 
+
 def le32(b, off):
     return struct.unpack_from("<I", b, off)[0]
+
 
 # BIFF 레코드 반복자
 def iter_biff_records(data: bytes):
@@ -15,7 +19,7 @@ def iter_biff_records(data: bytes):
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
         off += 4
-        payload = data[off:off + length]
+        payload = data[off : off + length]
         yield off - 4, opcode, length, payload
         off += length
 
@@ -50,7 +54,9 @@ def parse_short_xlucs(buf: bytes, off: int, single_byte_codec: str):
 
 
 def build_short_xlucs(text: str, cch: int, fHigh: int, single_byte_codec: str) -> bytes:
-    assert len(text) == cch
+    if len(text) != cch:
+        # 길이 불일치면 BIFF 구조 깨질 수 있으니 안전하게 예외
+        raise ValueError("ShortXLUnicodeString 길이(cch)와 text 길이가 일치하지 않습니다.")
 
     flags = fHigh & 0x01
     if fHigh:
@@ -64,8 +70,8 @@ def build_short_xlucs(text: str, cch: int, fHigh: int, single_byte_codec: str) -
 # ─────────────────────────────
 # SeriesText 추출 / 레닥션
 # ─────────────────────────────
-SERIESTEXT_OPCODE = 0x100D    # SeriesText
-FRTWRAPPER_RT     = 0x0851    # FrtWrapper.frtHeaderOld.rt 값
+SERIESTEXT_OPCODE = 0x100D  # SeriesText
+FRTWRAPPER_RT = 0x0851      # (여기서는 미사용) FrtWrapper.frtHeaderOld.rt 값
 
 
 def extract_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> List[str]:
@@ -73,14 +79,13 @@ def extract_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> List[st
     texts: List[str] = []
 
     for rec_off, opcode, length, payload in iter_biff_records(wb):
-
         # SeriesText(0x100D) 단독 레코드만 처리
         if opcode != SERIESTEXT_OPCODE:
             continue
         if length < 4:  # reserved(2) + 최소 payload
             continue
 
-        series_payload_off = rec_off + 4   # reserved가 시작하는 곳
+        series_payload_off = rec_off + 4  # reserved가 시작하는 곳
         reserved_off = series_payload_off
 
         # reserved = 2 bytes
@@ -97,13 +102,11 @@ def extract_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> List[st
     return texts
 
 
-
 def redact_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
     wb = bytearray(biff_bytes)
     red_total = 0
 
     for rec_off, opcode, length, payload in iter_biff_records(wb):
-
         # SeriesText 단독 레코드만 처리
         if opcode != SERIESTEXT_OPCODE:
             continue
@@ -128,7 +131,10 @@ def redact_seriesTexts(biff_bytes: bytes, single_byte_codec="cp949") -> bytes:
         print(f"[CHART - SERIES] SeriesText 매칭됨: {repr(text)} at 0x{st_off:08X}")
 
         masked_text = "*" * len(text)
-        new_st = build_short_xlucs(masked_text, cch, fHigh, single_byte_codec)
+        try:
+            new_st = build_short_xlucs(masked_text, cch, fHigh, single_byte_codec)
+        except Exception:
+            continue
 
         record_payload_start = rec_off + 4
         record_payload_end = record_payload_start + length
@@ -174,13 +180,11 @@ def extract_chart_text(file_bytes: bytes, single_byte_enc: str = "cp949") -> Lis
     return texts
 
 
-
 # ───────────────────────────────────────────────
 # EPRINT (EMF) 레닥션
 # ───────────────────────────────────────────────
-
-EMR_EXTTEXTOUTA  = 0x53
-EMR_EXTTEXTOUTW  = 0x54
+EMR_EXTTEXTOUTA = 0x53
+EMR_EXTTEXTOUTW = 0x54
 EMR_POLYTEXTOUTA = 0x60
 EMR_POLYTEXTOUTW = 0x61
 EMR_SMALLTEXTOUT = 0x6C
@@ -198,17 +202,16 @@ def iter_emf_records(data: bytearray):
             break
 
         payload_off = off + 8
-        payload = data[payload_off: off + rec_size]
+        payload = data[payload_off : off + rec_size]
 
         yield off, rec_type, rec_size, payload
-
         off += rec_size
 
 
 def parse_emr_polytextout(emf: bytearray, rec_off: int, rec_size: int, is_unicode: bool):
     base = rec_off
 
-    size = le32(emf, base+4)
+    size = le32(emf, base + 4)
     if size != rec_size:
         return []
 
@@ -249,8 +252,8 @@ def parse_emr_polytextout(emf: bytearray, rec_off: int, rec_size: int, is_unicod
             encoding = "cp949"
 
         str_start = base + offString
-        str_len   = chars * bpc
-        str_end   = str_start + str_len
+        str_len = chars * bpc
+        str_end = str_start + str_len
 
         if not (base <= str_start < str_end <= base + rec_size):
             continue
@@ -264,23 +267,26 @@ def parse_emr_smalltextout(emf: bytearray, rec_off: int, rec_size: int):
     base = rec_off
 
     rec_type = le32(emf, base)
-    size     = le32(emf, base+4)
+    size = le32(emf, base + 4)
 
     if rec_type != EMR_SMALLTEXTOUT or size != rec_size:
         return None
 
     pos = base + 8
 
-    x = le32(emf, pos); pos += 4
-    y = le32(emf, pos); pos += 4
+    # x, y
+    pos += 8
 
-    cChars     = le32(emf, pos); pos += 4
-    fuOptions  = le32(emf, pos); pos += 4
-    graphics   = le32(emf, pos); pos += 4
+    cChars = le32(emf, pos); pos += 4
+    fuOptions = le32(emf, pos); pos += 4
 
-    pos += 8   # exScale, eyScale
+    # iGraphicsMode
+    pos += 4
 
-    ETO_NO_RECT     = 0x100
+    # exScale, eyScale
+    pos += 8
+
+    ETO_NO_RECT = 0x100
     ETO_SMALL_CHARS = 0x8000
 
     if not (fuOptions & ETO_NO_RECT):
@@ -302,14 +308,13 @@ def parse_emr_smalltextout(emf: bytearray, rec_off: int, rec_size: int):
 
 
 def redact_emr_block(emf: bytearray, rec_off: int, is_unicode: bool) -> int:
-    rec_type = le32(emf, rec_off)
     rec_size = le32(emf, rec_off + 4)
 
     emrtext_off = rec_off + 0x24
-    if emrtext_off + 8 > rec_off + rec_size:
+    if emrtext_off + 16 > rec_off + rec_size:
         return 0
 
-    chars      = le32(emf, emrtext_off + 8)
+    chars = le32(emf, emrtext_off + 8)
     off_string = le32(emf, emrtext_off + 12)
 
     if chars == 0 or off_string == 0:
@@ -336,7 +341,7 @@ def redact_emr_block(emf: bytearray, rec_off: int, is_unicode: bool) -> int:
         return 0
 
     redacted = ("*" * len(text)).encode(enc)
-    redacted = redacted[:len(raw)].ljust(len(raw), b'*')
+    redacted = redacted[:len(raw)].ljust(len(raw), b"*")
 
     emf[str_start:str_end] = redacted
     print(f"[EMR] redacted text: {repr(text)} at 0x{str_start:08X}")
@@ -360,8 +365,7 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
             segs = parse_emr_polytextout(emf, rec_off, rec_size, is_unicode)
 
             for start, length, enc in segs:
-                raw = bytes(emf[start:start+length])
-
+                raw = bytes(emf[start : start + length])
                 try:
                     text = raw.decode(enc, errors="ignore")
                 except Exception:
@@ -369,8 +373,8 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
 
                 if find_sensitive_spans(normalization_text(text)):
                     red = ("*" * len(text)).encode(enc)
-                    red = red[:length].ljust(length, b'*')
-                    emf[start:start+length] = red
+                    red = red[:length].ljust(length, b"*")
+                    emf[start : start + length] = red
                     total += 1
                     print(f"[EMR-POLY] redacted {repr(text)} at 0x{start:08X}")
 
@@ -378,8 +382,7 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
             seg = parse_emr_smalltextout(emf, rec_off, rec_size)
             if seg:
                 start, length, enc = seg
-                raw = bytes(emf[start:start+length])
-
+                raw = bytes(emf[start : start + length])
                 try:
                     text = raw.decode(enc, errors="ignore")
                 except Exception:
@@ -387,8 +390,8 @@ def redact_emf_stream(emf_bytes: bytes) -> bytes:
 
                 if find_sensitive_spans(normalization_text(text)):
                     red = ("*" * len(text)).encode(enc)
-                    red = red[:length].ljust(length, b'*')
-                    emf[start:start+length] = red
+                    red = red[:length].ljust(length, b"*")
+                    emf[start : start + length] = red
                     total += 1
                     print(f"[EMR-SMALL] redacted {repr(text)} at 0x{start:08X}")
 
@@ -409,6 +412,7 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec: str = "cp949") -> byt
         temp_path = tmp.name
 
     try:
+        # olefile이 write_mode=True 및 write_stream(entry, data)를 지원하는 환경을 전제로 함
         with olefile.OleFileIO(temp_path, write_mode=True) as ole:
             entries = ole.listdir()
 
@@ -423,18 +427,14 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec: str = "cp949") -> byt
                 if top == "ObjectPool" and name in ("Workbook", "\x01Workbook"):
                     print(f"[INFO] redact Workbook: {'/'.join(entry)}")
 
-                    # 같은 핸들에서 바로 읽기
                     wb_data = ole.openstream(entry).read()
-
                     new_biff = redact_seriesTexts(wb_data, single_byte_codec)
 
                     if new_biff != wb_data:
-                        # 같은 엔트리를 그대로 사용해서 write_stream
                         ole.write_stream(entry, new_biff)
                         print(f"  [WRITE] Workbook updated: {'/'.join(entry)}")
                     else:
                         print("  [SKIP] Workbook unchanged")
-
 
                 # EPRINT 레닥션
                 if top == "ObjectPool" and name == "\x03EPRINT":
@@ -450,9 +450,7 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec: str = "cp949") -> byt
                         print("  [SKIP] EPRINT unchanged")
 
         with open(temp_path, "rb") as f:
-            result = f.read()
-
-        return result
+            return f.read()
 
     except Exception as e:
         print(f"[ERR] redact_workbooks exception: {e}")
@@ -460,6 +458,9 @@ def redact_workbooks(file_bytes: bytes, single_byte_codec: str = "cp949") -> byt
         return file_bytes
 
     finally:
-        # temp 파일 정리
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # temp 파일 정리 (충돌 마커 제거)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass

@@ -562,6 +562,7 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
 
 
 def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
             tmp.write(original_file_bytes)
@@ -577,11 +578,18 @@ def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> byt
 
         with open(tmp_path, "rb") as f:
             result = f.read()
-        os.remove(tmp_path)
         return result
+
     except Exception as e:
         print(f"[ERR] OLE 교체 중 오류: {e}")
         return original_file_bytes
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def redact_word_document(file_bytes: bytes) -> bytes:
@@ -604,6 +612,7 @@ def redact_word_document(file_bytes: bytes) -> bytes:
                     end = start + (e - s)
                 targets.append((start, end, val))
         return replace_text(file_bytes, targets)
+
     except Exception as e:
         print(f"[ERR] WordDocument 레닥션 중 예외: {e}")
         return file_bytes
