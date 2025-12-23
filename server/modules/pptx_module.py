@@ -44,6 +44,44 @@ except Exception:
         redact_image_bytes = None
 
 
+# ─────────────────────────────────────────────────────────────
+# XML 태그/노이즈 제거 (text/extract 미리보기용 공통 정리)
+# ─────────────────────────────────────────────────────────────
+_XML_TAG_RX = re.compile(r"(?s)<[^>]+>")
+
+def _clean_extracted_text(txt: str) -> str:
+    """
+    PPTX의 chart/xml 등에서 raw 태그 덩어리가 섞여 들어오는 문제 방지용.
+    - 태그 제거
+    - '<' '>' 남아있는 라인 통째 삭제
+    - 차트/임베디드에서 튀는 엑셀 참조/formatCode 노이즈 제거
+    """
+    if not txt:
+        return ""
+
+    t = (txt or "").replace("\r", "")
+
+    # 1) 태그 완전 제거(여러 줄 포함)
+    t = _XML_TAG_RX.sub(" ", t)
+
+    # 2) 그래도 남는 '<' '>' 포함 라인은 통째로 제거
+    lines: List[str] = []
+    for line in t.splitlines():
+        s = (line or "").strip()
+        if not s:
+            continue
+        if "<" in s or ">" in s:
+            continue
+        lines.append(s)
+    t = "\n".join(lines)
+
+    # 3) 엑셀 참조/포맷 노이즈 제거 (차트 numRef 등에서 자주 튐)
+    t = re.sub(r"Sheet\d*!\$[A-Z]+\$\d+(?::\$[A-Z]+\$\d+)?", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bGeneral\b(?=\s*\d)", "", t, flags=re.IGNORECASE)
+
+    return cleanup_text(t)
+
+
 def _env_bool(key: str, default: bool) -> bool:
     # env flag 읽기
     v = os.getenv(key)
@@ -234,6 +272,7 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
         except KeyError:
             continue
 
+        # 차트는 <a:t>, <c:v>에 들어있는 값만 추출하되, 혹시 태그가 섞이면 마지막에 정리
         for m in re.finditer(
             r"<a:t[^>]*>(.*?)</a:t>|<c:v[^>]*>(.*?)</c:v>",
             s,
@@ -258,7 +297,8 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
         except zipfile.BadZipFile:
             continue
 
-    return cleanup_text("\n".join(p for p in parts if p))
+    # ✅ 여기서 한 번 정리(태그/노이즈 제거) → 미리보기로 raw 태그가 새지 않게
+    return _clean_extracted_text("\n".join(p for p in parts if p))
 
 
 def pptx_text(zipf: zipfile.ZipFile) -> str:
@@ -275,7 +315,7 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
             continue
 
         all_txt += [
-            m.group(1)
+            (m.group(1) or "").strip()
             for m in re.finditer(r"<a:t[^>]*>(.*?)</a:t>", xml, re.DOTALL)
             if (m.group(1) or "").strip()
         ]
@@ -284,7 +324,8 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
     if chart_txt:
         all_txt.append(chart_txt)
 
-    return cleanup_text("\n".join(all_txt))
+    # ✅ 최종 합친 뒤에도 한 번 더 정리
+    return _clean_extracted_text("\n".join(all_txt))
 
 
 def extract_text(file_bytes: bytes) -> dict:
