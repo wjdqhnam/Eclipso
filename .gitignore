@@ -7,5 +7,5 @@ __pycache__/
 근희함.doc
 test.doc
 
-#NER 모듈 ignore
+# NER 모듈 ignore
 ner/
