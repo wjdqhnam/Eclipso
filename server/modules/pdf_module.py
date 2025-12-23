@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import tempfile
 from typing import List, Optional, Set, Dict, Tuple, Any
@@ -25,6 +26,17 @@ except Exception:  # pragma: no cover
 
 log_prefix = "[PDF]"
 logger = logging.getLogger(__name__)
+
+def _pdf_extract_debug_enabled() -> bool:
+    return os.getenv("ECLIPSO_PDF_EXTRACT_DEBUG", "0") == "1"
+
+def _vis_ws(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.replace("\r", "\\r")
+    s = s.replace("\t", "\\t")
+    s = s.replace("\n", "\\n\n")
+    return s
 
 
 def _compact_ws(s: str) -> str:
@@ -199,6 +211,10 @@ def extract_text_indexed(pdf_bytes: bytes) -> dict:
             except Exception:
                 tables = []
 
+            dbg_on = _pdf_extract_debug_enabled()
+            if dbg_on and tables:
+                logger.info("%s tables_detected page=%d count=%d", log_prefix, pidx + 1, len(tables))
+
             for tab in tables:
                 try:
                     bbox = fitz.Rect(getattr(tab, "bbox"))
@@ -209,6 +225,11 @@ def extract_text_indexed(pdf_bytes: bytes) -> dict:
                 global_line_id = next_line
                 y0 = float(bbox.y0)
                 if seg_text.strip():
+                    if dbg_on:
+                        # 표 텍스트는 셀/줄 경계로 인해 단어가 분리되기 쉬우므로,
+                        # 공백/개행이 보이도록 스니펫 로그를 남긴다.
+                        snip = seg_text[:400]
+                        logger.info("%s table_text_snip page=%d:\n%s", log_prefix, pidx + 1, _vis_ws(snip))
                     segments.append((y0, seg_text, seg_chars))
 
             words_all = page.get_text("words") or []

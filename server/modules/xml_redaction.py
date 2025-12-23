@@ -81,14 +81,8 @@ def _collect_hwpx_secrets(zin: zipfile.ZipFile) -> List[str]:
 def _ner_entities_to_extra_comp(
     ner_entities: Optional[List[Any]],
     ner_allowed: Optional[List[str]] = None,
+    masking_policy: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[str, re.Pattern, bool, int, Optional[object]]]:
-    """
-    클라이언트가 /ner/predict로 받은 entities(ner_entities_json)를
-    XML 레닥션 파이프라인이 이해하는 comp(tuple)로 변환한다.
-
-    comp 형태: (rule_name, compiled_regex, need_valid, priority, validator)
-    - 여기서는 validator 없이 exact-literal 매칭만 수행한다.
-    """
     if not isinstance(ner_entities, list) or not ner_entities:
         return []
 
@@ -102,6 +96,8 @@ def _ner_entities_to_extra_comp(
     seen: Set[str] = set()
     out: List[Tuple[str, re.Pattern, bool, int, Optional[object]]] = []
 
+    ps_mode = str((masking_policy or {}).get("ps") or "full")
+
     for ent in ner_entities:
         if not isinstance(ent, dict):
             continue
@@ -110,7 +106,20 @@ def _ner_entities_to_extra_comp(
         if allow_set is not None and lab and lab not in allow_set:
             continue
 
-        txt = str(ent.get("text") or "").strip()
+        txt = str(ent.get("text") or "")
+        txt_strip = txt.strip()
+
+        # PS: 성(첫 글자)만 남기기 옵션이면, 엔티티 전체가 아니라 "이름 부분"만 추가 패턴으로 넣는다.
+        if lab == "PS" and ps_mode == "keep_first_char":
+            t = txt_strip
+            # 한글 이름(공백 없는)만 대상으로 단순 처리
+            if re.fullmatch(r"[\uAC00-\uD7A3]+", t or ""):
+                if len(t) <= 1:
+                    continue
+                txt = t[1:]
+                txt_strip = txt.strip()
+
+        txt = txt_strip
         if not txt or len(txt) < min_len:
             continue
 
@@ -257,10 +266,15 @@ def xml_redact_to_file(
     filename: str,
     ner_entities: Optional[List[Any]] = None,
     ner_allowed: Optional[List[str]] = None,
+    masking_policy: Optional[Dict[str, Any]] = None,
 ) -> None:
     # XML 포맷 레닥션 → 파일 저장
     base_comp = compile_rules()
-    extra_comp = _ner_entities_to_extra_comp(ner_entities, ner_allowed=ner_allowed)
+    extra_comp = _ner_entities_to_extra_comp(
+        ner_entities,
+        ner_allowed=ner_allowed,
+        masking_policy=masking_policy,
+    )
     comp = base_comp + extra_comp
     kind = detect_xml_type(filename)
     log.info("XML redact: file=%s kind=%s", filename, kind)

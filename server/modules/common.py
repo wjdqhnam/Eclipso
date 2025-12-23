@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover
 __all__ = [
     # 공개 유틸
     "cleanup_text",
+    "cleanup_text_keep_tabs",
     "compile_rules",
     "sub_text_nodes",
     "chart_sanitize",
@@ -37,6 +38,24 @@ def cleanup_text(text: str) -> str:
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+
+def cleanup_text_keep_tabs(text: str) -> str:
+    """
+    레이아웃(표/탭 정렬)을 최대한 보존하는 정리 함수.
+    - 탭(\t)을 공백으로 뭉개지 않는다.
+    - 줄바꿈 정리(Windows 개행 통일, 과도한 빈 줄 축소)만 최소 적용.
+    """
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 줄 끝 공백만 제거(탭은 유지)
+    t = re.sub(r"[ ]+\n", "\n", t)
+    # 과도한 빈 줄만 축소
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    # 여러 공백은 한 칸으로(탭은 유지)
+    t = re.sub(r"[ ]{2,}", " ", t)
     return t.strip()
 
 # ---------- 룰 컴파일 + 우선순위 ----------
@@ -221,7 +240,7 @@ def chart_rels_sanitize(rels_bytes: bytes) -> Tuple[bytes, int]:
     return rels_bytes, 0
 
 
-def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:        
+def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     return sub_text_nodes(xml_bytes, comp)
 
 # ---------- DOCX [Content_Types].xml 보정(스텁) ----------

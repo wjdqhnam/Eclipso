@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import tempfile
 import traceback
 from pathlib import Path
@@ -15,6 +16,8 @@ from server.modules.ner_module import run_ner
 from server.modules.xml_redaction import xml_redact_to_file
 
 router = APIRouter(prefix="/redact", tags=["redact"])
+
+_HANGUL_RE = re.compile(r"^[\uAC00-\uD7A3]+$")
 
 
 def _is_email_rule(rule_name: str) -> bool:
@@ -51,12 +54,84 @@ def _safe_load_json_list(s: Optional[str]) -> Optional[List[Any]]:
         return None
 
 
+def _safe_load_json_dict(s: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _subspan(base: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    d = dict(base)
+    d["start"] = int(start)
+    d["end"] = int(end)
+    if isinstance(base.get("text"), str):
+        try:
+            rel0 = int(start) - int(base.get("start", start))
+            rel1 = int(end) - int(base.get("start", start))
+            d["text"] = base["text"][max(0, rel0) : max(0, rel1)]
+        except Exception:
+            pass
+    return d
+
+
+def _apply_masking_policy_spans(
+    spans: List[Dict[str, Any]],
+    full_text: str,
+    masking_policy: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not spans:
+        return []
+    pol = masking_policy or {}
+    ps_mode = str(pol.get("ps") or "full")
+
+    out: List[Dict[str, Any]] = []
+    for sp in spans:
+        if not isinstance(sp, dict):
+            continue
+        try:
+            s = int(sp.get("start"))
+            e = int(sp.get("end"))
+        except Exception:
+            continue
+        if e <= s:
+            continue
+        seg = str(sp.get("text") or full_text[s:e])
+
+        lab = str(sp.get("label") or "").upper()
+        # NOTE: 부분 마스킹은 현재 PS만 지원
+
+        # --- PS: 성만 남기기 ---
+        if lab == "PS" and ps_mode == "keep_first_char":
+            t = seg.strip()
+            if _HANGUL_RE.fullmatch(t or ""):
+                if len(t) == 1:
+                    continue
+                # "홍 길동"처럼 분리된 경우(2글자 given-name)는 전부 가리기, 3글자 이상은 첫 글자만 남김
+                if len(t) == 2:
+                    out.append(sp)
+                else:
+                    out.append(_subspan(sp, s + 1, e))
+                continue
+            out.append(sp)
+            continue
+
+        out.append(sp)
+
+    out.sort(key=lambda x: (int(x.get("start", 0)), int(x.get("end", 0))))
+    return out
+
+
 @router.post("/file", response_class=Response, summary="파일 레닥션")
 async def redact_file(
     file: UploadFile = File(...),
     rules_json: Optional[str] = Form(None),
     ner_labels_json: Optional[str] = Form(None),
     ner_entities_json: Optional[str] = Form(None),
+    masking_json: Optional[str] = Form(None),
 ):
     ext = Path(file.filename).suffix.lower()
     file_bytes = await file.read()
@@ -82,6 +157,7 @@ async def redact_file(
             ner_allowed = None
 
     client_entities = _safe_load_json_list(ner_entities_json)
+    masking_policy = _safe_load_json_dict(masking_json)
 
     out: Optional[bytes] = None
     mime = "application/octet-stream"
@@ -122,6 +198,7 @@ async def redact_file(
                             "start": s,
                             "end": e,
                             "label": it.get("label") or rule_name or "REGEX",
+                            "rule": rule_name,
                             "source": "regex",
                             "score": None,
                         }
@@ -234,6 +311,10 @@ async def redact_file(
                 enriched.append({**sp, "start": s, "end": e, "text": text})
 
             print(f"[PDF][DEBUG] enriched_spans={len(enriched)} sample={enriched[:3]}")
+
+            # 5) 부분 마스킹 정책 적용(스팬을 쪼개서 부분만 레닥션)
+            if masking_policy:
+                enriched = _apply_masking_policy_spans(enriched, plain_text, masking_policy)
 
             out = _call_apply_text_redaction(file_bytes, enriched)
             mime = "application/pdf"
@@ -385,6 +466,9 @@ async def redact_file(
 
             print(f"[HWP][DEBUG] enriched_spans={len(enriched)} sample={enriched[:3]}")
 
+            if masking_policy:
+                enriched = _apply_masking_policy_spans(enriched, plain_text, masking_policy)
+
             out = hwp_module.redact(file_bytes, spans=enriched)
             mime = "application/x-hwp"
 
@@ -525,6 +609,9 @@ async def redact_file(
                     continue
                 enriched.append({**sp, "start": s, "end": e, "text": text})
 
+            if masking_policy:
+                enriched = _apply_masking_policy_spans(enriched, plain_text, masking_policy)
+
             # 모듈이 spans를 받으면 전달 (doc/ppt/xls: NER 탐지 반영)
             try:
                 out = mod.redact(file_bytes, spans=enriched)  # type: ignore[call-arg]
@@ -546,6 +633,7 @@ async def redact_file(
                     file.filename,
                     ner_entities=client_entities,
                     ner_allowed=ner_allowed,
+                    masking_policy=masking_policy,
                 )
                 with open(dst, "rb") as f:
                     out = f.read()

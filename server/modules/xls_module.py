@@ -8,6 +8,11 @@ from server.core.matching import find_sensitive_spans
 SST = 0x00FC
 CONTINUE = 0x003C
 LABELSST = 0x00FD
+LABEL = 0x0204
+NUMBER = 0x0203
+RK = 0x027E
+BOUNDSHEET = 0x0085
+EOF = 0x000A
 HEADER = 0x0014
 FOOTER = 0x0015
 HEADERFOOTER = 0x089C
@@ -27,6 +32,171 @@ def iter_biff_records(data: bytes):
         off += length
         yield opcode, length, payload, header_off
 
+
+def iter_biff_records_from(data: bytes, start_off: int):
+    off, n = int(start_off), len(data)
+    while off + 4 <= n:
+        opcode, length = struct.unpack_from("<HH", data, off)
+        header_off = off
+        off += 4
+        payload = data[off:off + length]
+        off += length
+        yield opcode, length, payload, header_off
+
+
+def _escape_html(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _cell_to_html(cell: str) -> str:
+    s = (cell or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _escape_html(s).replace("\n", "<br/>")
+
+
+def _rows_to_html_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    w = max((len(r) for r in rows), default=0)
+    rect = [list(r) + [""] * (w - len(r)) for r in rows]
+    out: List[str] = []
+    out.append("<table>")
+    out.append("<tbody>")
+    for r in rect:
+        out.append("<tr>")
+        for c in r:
+            out.append(f"<td>{_cell_to_html(c)}</td>")
+        out.append("</tr>")
+    out.append("</tbody>")
+    out.append("</table>")
+    return "\n".join(out)
+
+
+def _parse_boundsheets(wb: bytes) -> List[Tuple[str, int]]:
+    """
+    Workbook 글로벌 스트림에서 BOUNDSHEET들을 읽어 (시트명, 시트BOF오프셋) 리스트 반환.
+    """
+    out: List[Tuple[str, int]] = []
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode != BOUNDSHEET:
+            continue
+        if len(payload) < 8:
+            continue
+        off = le32(payload, 0)
+        name_len = payload[6]
+        flags = payload[7]
+        name_bytes = payload[8:8 + (name_len * (2 if (flags & 0x01) else 1))]
+        try:
+            if flags & 0x01:
+                name = name_bytes.decode("utf-16le", errors="ignore")
+            else:
+                name = name_bytes.decode("latin1", errors="ignore")
+        except Exception:
+            name = f"Sheet@{off}"
+        out.append((name or f"Sheet@{off}", int(off)))
+    return out
+
+
+def _extract_sheet_grid(wb: bytes, strings: List[str], sheet_off: int, max_rows: int = 200, max_cols: int = 50) -> List[List[str]]:
+    """
+    시트 서브스트림에서 LABELSST/NUMBER/LABEL을 기반으로 간단한 셀 그리드를 복원.
+    """
+    cells: Dict[int, Dict[int, str]] = {}
+    max_r = 0
+    max_c = 0
+
+    for opcode, length, payload, hdr in iter_biff_records_from(wb, sheet_off):
+        if opcode == EOF:
+            break
+        try:
+            if opcode == LABELSST and len(payload) >= 10:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                if r + 1 > max_rows or c + 1 > max_cols:
+                    continue
+                sst_idx = le32(payload, 6)
+                v = strings[sst_idx] if 0 <= sst_idx < len(strings) else ""
+                if v:
+                    cells.setdefault(r + 1, {})[c + 1] = v
+                    max_r = max(max_r, r + 1)
+                    max_c = max(max_c, c + 1)
+            elif opcode == NUMBER and len(payload) >= 14:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                if r + 1 > max_rows or c + 1 > max_cols:
+                    continue
+                val = struct.unpack_from("<d", payload, 6)[0]
+                v = str(int(val)) if abs(val - int(val)) < 1e-9 else str(val)
+                cells.setdefault(r + 1, {})[c + 1] = v
+                max_r = max(max_r, r + 1)
+                max_c = max(max_c, c + 1)
+            elif opcode == LABEL and len(payload) >= 8:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                if r + 1 > max_rows or c + 1 > max_cols:
+                    continue
+                cch = le16(payload, 6)
+                raw = payload[8:8 + cch]
+                try:
+                    v = raw.decode("latin1", errors="ignore")
+                except Exception:
+                    v = ""
+                if v:
+                    cells.setdefault(r + 1, {})[c + 1] = v
+                    max_r = max(max_r, r + 1)
+                    max_c = max(max_c, c + 1)
+        except Exception:
+            continue
+
+    if not cells:
+        return []
+
+    rows: List[List[str]] = []
+    for r in range(1, max_r + 1):
+        row = [cells.get(r, {}).get(c, "") for c in range(1, max_c + 1)]
+        if any(x.strip() for x in row):
+            rows.append(row)
+    return rows
+
+
+def extract_markdown_tables_from_xls(file_bytes: bytes) -> str:
+    """
+    XLS(OLE/BIFF)에서 시트별 표 형태를 최대한 복원하여 markdown(HTML table 포함)을 생성.
+    """
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            if not ole.exists("Workbook"):
+                return ""
+            wb = ole.openstream("Workbook").read()
+    except Exception:
+        return ""
+
+    blocks = get_sst_blocks(wb)
+    if blocks:
+        xlucs_list = SSTParser(blocks).parse()
+        strings = [x.text for x in xlucs_list]
+    else:
+        strings = []
+
+    sheets = _parse_boundsheets(wb)
+    if not sheets:
+        return ""
+
+    out: List[str] = []
+    for name, off in sheets:
+        rows = _extract_sheet_grid(wb, strings, off)
+        if not rows:
+            continue
+        out.append(f"**Sheet: {_escape_html(name)}**")
+        out.append(_rows_to_html_table(rows))
+        out.append("")
+    return "\n\n".join(out).strip()
 
 # ───────────────────────────────────────────────
 # 본문 SST + CONTINUE 부분
@@ -327,11 +497,13 @@ def extract_text_from_xls(file_bytes: bytes) -> dict:
         # 전체 합치기
         combined_texts = body + header_texts
         full_text = "\n".join(combined_texts)
+        md = extract_markdown_tables_from_xls(file_bytes)
 
         return {
             "body": body,
             "header_footer": header_texts,
             "full_text": full_text,
+            "markdown": md if isinstance(md, str) and md.strip() else full_text,
             "pages": [{"page": 1, "text": full_text}],
         }
 

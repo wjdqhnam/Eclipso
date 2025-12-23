@@ -85,10 +85,19 @@ async def extract_text(file: UploadFile):
             except Exception as e:
                 logger.warning("PDF markdown 생성 실패: %s", e)
 
+        # UI는 모든 확장자를 "Markdown"으로 렌더링한다.
+        # - PDF는 markdown을 제공할 수 있음
+        # - 그 외(또는 PDF에서도 markdown 생성 실패)는 full_text를 markdown으로 그대로 사용
+        #   (형식을 임의로 변환하지 않기 때문에 정보 손실/추정이 없음)
+        if isinstance(data, dict):
+            md = data.get("markdown")
+            if not isinstance(md, str) or not md.strip():
+                ft = data.get("full_text")
+                data["markdown"] = ft if isinstance(ft, str) else ""
+
         return data
 
     except HTTPException:
-        # extract_from_file 등이 올바르게 던진 status_code(예: 415)를 500으로 덮어쓰지 않도록 그대로 전달
         raise
     except Exception as e:
         logger.exception("텍스트 추출 중 오류: filename=%s", getattr(file, "filename", None))
@@ -181,9 +190,19 @@ async def detect(req: dict):
 @router.post("/markdown")
 async def extract_markdown_endpoint(file: UploadFile):
     filename = (file.filename or "").lower()
-    if not filename.endswith(".pdf"):
-        raise HTTPException(400, "PDF만 지원")
+    raw_bytes = await file.read()
 
-    pdf_bytes = await file.read()
-    data = extract_pdf_markdown(pdf_bytes)
-    return data
+    # PDF는 pdf_module의 markdown을 사용
+    if filename.endswith(".pdf"):
+        return extract_pdf_markdown(raw_bytes)
+
+    # 그 외: 모듈이 markdown을 제공하면 우선 사용, 없으면 full_text를 markdown으로 반환
+    await file.seek(0)
+    data = await extract_from_file(file)
+    if not isinstance(data, dict):
+        raise HTTPException(500, "extract_from_file 결과 형식이 올바르지 않습니다.")
+    md = data.get("markdown")
+    if isinstance(md, str) and md.strip():
+        return {"markdown": md}
+    ft = data.get("full_text")
+    return {"markdown": ft if isinstance(ft, str) else ""}
