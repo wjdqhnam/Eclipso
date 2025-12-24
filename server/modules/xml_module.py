@@ -109,11 +109,6 @@ def _extract_wordprocessingml_table(root: ET.Element) -> Optional[str]:
 
 
 def extract_text(file_bytes: bytes) -> Dict[str, Any]:
-    """
-    .xml 파일 텍스트/표 추출.
-    - 표가 있으면 markdown에 <table> HTML을 포함시켜 레이아웃 보존
-    - full_text는 검색/탐지를 위한 평문을 제공
-    """
     # UTF-8 우선, 실패 시 유니코드 대체
     try:
         s = file_bytes.decode("utf-8")

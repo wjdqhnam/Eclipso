@@ -592,7 +592,7 @@ def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> byt
                 pass
 
 
-def redact_word_document(file_bytes: bytes) -> bytes:
+def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
     try:
         data = extract_text(file_bytes)
         raw_text = data.get("raw_text", "")
@@ -603,14 +603,58 @@ def redact_word_document(file_bytes: bytes) -> bytes:
         matches = find_sensitive_spans(norm_text)
         matches = split_matches(matches, norm_text)
 
+        span_ranges: List[Tuple[int, int]] = []
+        if spans and isinstance(spans, list):
+            n = len(norm_text)
+            for sp in spans:
+                if not isinstance(sp, dict):
+                    continue
+                s = sp.get("start")
+                e = sp.get("end")
+                if s is None or e is None:
+                    continue
+                try:
+                    s = int(s)
+                    e = int(e)
+                except Exception:
+                    continue
+                s = max(0, min(n, s))
+                e = max(0, min(n, e))
+                if e <= s:
+                    continue
+                span_ranges.append((s, e))
+        if span_ranges:
+            # find_sensitive_spans와 동일 포맷으로 합치기(값은 참고용)
+            for s, e in span_ranges:
+                matches.append((s, e, norm_text[s:e], "SPAN"))
+
         targets = []
+        def _map_pos(idx: int) -> Optional[int]:
+            if idx in index_map:
+                return index_map[idx]
+            j = idx
+            while j >= 0 and j not in index_map:
+                j -= 1
+            if j >= 0 and j in index_map:
+                return index_map[j]
+            j = idx
+            while j < len(norm_text) and j not in index_map:
+                j += 1
+            if j < len(norm_text) and j in index_map:
+                return index_map[j]
+            return None
+
         for s, e, val, _ in matches:
-            if s in index_map and (e - 1) in index_map:
-                start = index_map[s]
-                end = index_map.get(e - 1, start) + 1
-                if end <= start:
-                    end = start + (e - s)
-                targets.append((start, end, val))
+            if not isinstance(s, int) or not isinstance(e, int) or e <= s:
+                continue
+            start = _map_pos(s)
+            end0 = _map_pos(e - 1)
+            if start is None or end0 is None:
+                continue
+            end = end0 + 1
+            if end <= start:
+                end = start + max(1, (e - s))
+            targets.append((start, end, val))
         return replace_text(file_bytes, targets)
 
     except Exception as e:
@@ -618,7 +662,7 @@ def redact_word_document(file_bytes: bytes) -> bytes:
         return file_bytes
 
 
-def redact(file_bytes: bytes) -> bytes:
-    redacted_doc = redact_word_document(file_bytes)
+def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
+    redacted_doc = redact_word_document(file_bytes, spans=spans)
     redacted_doc = redact_workbooks(redacted_doc)
     return redacted_doc

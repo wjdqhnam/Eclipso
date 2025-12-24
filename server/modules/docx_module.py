@@ -6,8 +6,6 @@ import zipfile
 import logging
 import os
 import inspect
-import xml.etree.ElementTree as ET
-from typing import List, Tuple, Optional
 from typing import List, Tuple
 
 try:
@@ -35,6 +33,20 @@ except Exception:  # pragma: no cover - 구조가 달라졌을 때 대비
 
 # ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
 try:
+    from ..core.schemas import XmlMatch, XmlLocation
+except Exception:  # pragma: no cover
+    from server.core.schemas import XmlMatch, XmlLocation  # type: ignore
+
+log = logging.getLogger("docx_module")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] docx_module: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(logging.INFO)
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
+try:
     from .ocr_image_redactor import redact_image_bytes
 except Exception:
     try:
@@ -53,6 +65,7 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix: str, logger, debug: bool):
+
     kwargs = {}
     try:
         sig = inspect.signature(fn)
@@ -68,11 +81,9 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
         _set_kw("filename", filename)
         _set_kw("name", filename)
         _set_kw("path", filename)
-
         _set_kw("env_prefix", env_prefix)
         _set_kw("prefix", env_prefix)
         _set_kw("env", env_prefix)
-
         _set_kw("logger", logger)
         _set_kw("log", logger)
 
@@ -94,7 +105,81 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
         pos_count = len(pos_params)
 
     except Exception:
-        from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
+        sig = None
+        params = {}
+        has_varkw = False
+        comp_kw_name = None
+        pos_count = 0
+
+    last_err = None
+
+    def _normalize_ret(ret):
+        if isinstance(ret, tuple) and len(ret) == 2:
+            red, hit = ret
+            if isinstance(red, bytearray):
+                red = bytes(red)
+            if isinstance(red, bytes):
+                try:
+                    return red, int(hit)
+                except Exception:
+                    return red, -1
+            return None
+
+        if isinstance(ret, bytearray):
+            return bytes(ret), -1
+        if isinstance(ret, bytes):
+            return ret, -1
+        return None
+
+    # 1) (data, comp, **kwargs)
+    try:
+        if sig is None or has_varkw or pos_count >= 2:
+            ret = fn(data, comp, **kwargs)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 2) (data, **kwargs)
+    try:
+        ret = fn(data, **kwargs)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 3) (data)
+    try:
+        ret = fn(data)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 4) (data, rules/comp=<...>, **kwargs)
+    try:
+        if comp_kw_name is not None:
+            kw2 = dict(kwargs)
+            kw2[comp_kw_name] = comp
+            ret = fn(data, **kw2)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    raise TypeError(f"redact_image_bytes call failed: {last_err!r}")
 
 def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
     parts: List[str] = []
@@ -145,6 +230,7 @@ def docx_text(zipf: zipfile.ZipFile) -> str:
     except KeyError:
         xml_bytes = b""
 
+    xml = xml_bytes.decode("utf-8", "ignore")
     text_main = "".join(
         m.group(1) for m in re.finditer(r"<w:t[^>]*>(.*?)</w:t>", xml, re.DOTALL)
     )
@@ -199,7 +285,6 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 
     return out, "docx", text
 
-─
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
     log.info(
@@ -211,6 +296,10 @@ def redact_item(filename: str, data: bytes, comp):
 
     if low == "[content_types].xml":
         return sanitize_docx_content_types(data)
+
+    # 차트 관계(rels) 중 외부 링크 제거
+    if low.startswith("word/charts/_rels/") and low.endswith(".rels"):
+        return chart_rels_sanitize(data)
 
     if low == "word/document.xml":
         return sub_text_nodes(data, comp)[0]

@@ -438,9 +438,6 @@ function buildDetections(matchData, nerItems, nerAllowLabels) {
   return out
 }
 
-/**
- * bbox 없으니, MD 문자열에 inline HTML span을 삽입해서 표시.
- */
 function injectBoxesIntoMarkdown(md, detections) {
   let s = String(md || '')
   if (!s.trim() || !detections?.length) return s

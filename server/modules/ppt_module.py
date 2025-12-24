@@ -6,8 +6,6 @@ import logging
 import os
 import re
 import struct
-import re
-from typing import List, Tuple, Iterable, Optional, Any, TYPE_CHECKING
 import unicodedata
 import zlib
 from io import BytesIO
@@ -485,6 +483,22 @@ def extract_text(file_bytes: bytes) -> Dict[str, Any]:
     return out
 
 
+def _collect_literals_from_spans(spans) -> List[str]:
+    out: List[str] = []
+    if not spans or not isinstance(spans, list):
+        return out
+    for sp in spans:
+        if not isinstance(sp, dict):
+            continue
+        t = sp.get("text")
+        if t is None:
+            continue
+        v = str(t).strip()
+        if len(v) >= 2:
+            out.append(v)
+    return sorted(set(out), key=lambda x: (-len(x), x))
+
+
 def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
     try:
         from .ole_redactor import redact_ole_bin_preserve_size  # type: ignore
@@ -508,6 +522,15 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
         log.info("[PPT] extract_text 결과가 비어 있음 → 레닥션 생략")
         return file_bytes
 
+    # spans(정규식+NER)로 넘어온 텍스트 리터럴이 있으면 우선 사용
+    span_literals = _collect_literals_from_spans(spans)
+    if span_literals:
+        try:
+            return redact_ole_bin_preserve_size(file_bytes, span_literals, mask_preview=False)
+        except Exception as e:
+            log.info(f"[PPT] redact_ole_bin_preserve_size(spans) 예외: {e!r}")
+            # fallback to rule-based below
+
     norm_text, index_map = normalization_index(raw_text)
 
     try:
@@ -520,21 +543,36 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
         log.info("[PPT] 민감정보 매칭 0건 → 레닥션 생략")
         return file_bytes
 
+    def _map_pos(idx: int) -> Optional[int]:
+        if idx in index_map:
+            return index_map[idx]
+        j = idx
+        while j >= 0 and j not in index_map:
+            j -= 1
+        if j >= 0 and j in index_map:
+            return index_map[j]
+        j = idx
+        while j < len(norm_text) and j not in index_map:
+            j += 1
+        if j < len(norm_text) and j in index_map:
+            return index_map[j]
+        return None
+
     secrets: List[str] = []
-    if text:
-        spans = list(_iter_rule_matches(text)) if _RULES else []
-        if spans:
-            _ = _mask_same_len(text, spans)
-            for s, e in spans:
-                seg = text[s:e].strip()
-                if len(seg) >= 2:
-                    secrets.append(seg)
-        if secrets:
-            uniq, seen = [], set()
-            for s in secrets:
-                if s not in seen:
-                    seen.add(s); uniq.append(s)
-            secrets = uniq
+    for s_idx, e_idx, _val, _name in matches:
+        if not isinstance(s_idx, int) or not isinstance(e_idx, int) or e_idx <= s_idx:
+            continue
+        start = _map_pos(s_idx)
+        end0 = _map_pos(e_idx - 1)
+        if start is None or end0 is None:
+            continue
+        end = end0 + 1
+        if end <= start:
+            continue
+
+        frag = raw_text[start:end].strip()
+        if len(frag) >= 2:
+            secrets.append(frag)
 
     if not secrets:
         log.info("[PPT] 매칭은 있으나 실제 시크릿 문자열이 비어 있음 → 레닥션 생략")

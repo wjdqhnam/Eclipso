@@ -21,7 +21,6 @@ from server.core.regex_utils import match_text
 try:
     from server.modules.common import cleanup_text
 except Exception:  # pragma: no cover
-    # 안전장치(환경에 따라 import 경로가 달라질 수 있음)
     from ..modules.common import cleanup_text  # type: ignore
 
 # Optional OCR deps (없으면 OCR 기능 비활성)
@@ -462,10 +461,7 @@ def detect_boxes_from_patterns(pdf_bytes: bytes, patterns: Optional[List[Pattern
 
     return boxes
 
-
-# ──────────────────────────────────────────────
 # OCR -> Boxes (optional)
-# ──────────────────────────────────────────────
 def _page_to_pil(page: fitz.Page, dpi: int = 120):
     if Image is None:
         return None
@@ -591,9 +587,7 @@ def apply_text_redaction(
     return apply_redaction(pdf_bytes, boxes, fill=fill)
 
 
-# ──────────────────────────────────────────────
 # Table layout (/redactions/tables)
-# ──────────────────────────────────────────────
 def extract_table_layout(pdf_bytes: bytes) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:

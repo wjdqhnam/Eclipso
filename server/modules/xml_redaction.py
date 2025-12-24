@@ -48,6 +48,11 @@ try:
 except Exception:
     from server.modules.common import compile_rules
 
+try:
+    from .common import mask_literals_in_xml_text_nodes
+except Exception:
+    from server.modules.common import mask_literals_in_xml_text_nodes  # type: ignore
+
 log = logging.getLogger("xml_redaction")
 
 
@@ -189,10 +194,40 @@ def _rewrite_zip_replacing_previews(
         os.path.basename(dst_path),
     )
 
-def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
+def xml_redact_to_file(
+    src_path: str,
+    dst_path: str,
+    filename: str,
+    ner_entities: Optional[List[Dict[str, Any]]] = None,
+    ner_allowed: Optional[List[str]] = None,
+    masking_policy: Optional[Dict[str, Any]] = None,
+    **_kwargs: Any,
+) -> None:
     comp = compile_rules()
     kind = detect_xml_type(filename)
     log.info("XML redact: file=%s kind=%s", filename, kind)
+    _ = (ner_entities, ner_allowed, masking_policy)
+
+    allowed_set = {str(x).upper() for x in (ner_allowed or []) if str(x).strip()} if ner_allowed else None
+
+    ner_literals: List[str] = []
+    if ner_entities and isinstance(ner_entities, list):
+        for ent in ner_entities:
+            if not isinstance(ent, dict):
+                continue
+            lab = str(ent.get("label") or ent.get("entity_group") or ent.get("entity") or "").upper()
+            if allowed_set is not None and lab and lab not in allowed_set:
+                continue
+            t = ent.get("text") or ent.get("value")
+            if t is None:
+                continue
+            v = str(t).strip()
+            if len(v) >= 2:
+                ner_literals.append(v)
+
+    # dedupe + 긴 문자열 우선
+    if ner_literals:
+        ner_literals = sorted(set(ner_literals), key=lambda x: (-len(x), x))
 
     original_preview_names: List[str] = []
     if kind == "hwpx":
@@ -229,15 +264,38 @@ def xml_redact_to_file(src_path: str, dst_path: str, filename: str) -> None:
             for item in zin.infolist():
                 name = item.filename
                 data = zin.read(name)
+                low = name.lower()
+
+                if kind == "hwpx" and low == "mimetype":
+                    kept += 1
+                    continue
 
                 if kind == "docx":
-                    _write(item, docx.redact_item(name, data, comp), data)
+                    red = docx.redact_item(name, data, comp)
                 elif kind == "xlsx":
-                    _write(item, xlsx.redact_item(name, data, comp), data)
+                    red = xlsx.redact_item(name, data, comp)
                 elif kind == "pptx":
-                    _write(item, pptx.redact_item(name, data, comp), data)
+                    red = pptx.redact_item(name, data, comp)
                 elif kind == "hwpx":
-                    _write(item, hwpx.redact_item(name, data, comp), data)
+                    red = hwpx.redact_item(name, data, comp)
+                else:
+                    red = None
+
+    
+                try:
+                    if ner_literals and isinstance(red, (bytes, bytearray, type(None))):
+                        base = data if red is None else bytes(red)
+                        if base and low.endswith((".xml",)):
+                            base2 = mask_literals_in_xml_text_nodes(base, ner_literals)
+                            if red is None:
+                                red = base2 if base2 != base else None
+                            else:
+                                red = base2
+                except Exception:
+                    pass
+
+                if kind not in ("",) and kind in ("docx", "xlsx", "pptx", "hwpx"):
+                    _write(item, red, data)
                 else:
                     zout.writestr(item, data); kept += 1
 

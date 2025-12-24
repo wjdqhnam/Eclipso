@@ -3,6 +3,7 @@ import io
 import re
 import zipfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from typing import List, Tuple, Optional, Callable
 
 try:
@@ -15,7 +16,10 @@ __all__ = [
     "cleanup_text_keep_tabs",
     "compile_rules",
     "sub_text_nodes",
+    "mask_literals_in_xml_text_nodes",
     "chart_sanitize",
+    "chart_rels_sanitize",
+    "sanitize_docx_content_types",
     "xlsx_text_from_zip",
     "redact_embedded_xlsx_bytes",
     "HWPX_STRIP_PREVIEW",
@@ -39,6 +43,19 @@ def cleanup_text(text: str) -> str:
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+def cleanup_text_keep_tabs(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        t = unicodedata.normalize("NFKC", t)
+    except Exception:
+        pass
+    t = re.sub(r"[ ]+\n", "\n", t)       
+    t = re.sub(r"\n{3,}", "\n\n", t)     
+    t = re.sub(r"[ ]{2,}", " ", t)       
     return t.strip()
 
 _RULE_PRIORITY = {
@@ -111,7 +128,7 @@ def _mask_keep_rules(v: str) -> str:
         if ch.isalnum() or ch in "._":
             return "*"
         return ch
-    return _mask_preserving_entities(v, _m)
+    return _mask_preserving_entities(v, _mask)
 
 def _mask_value(rule: str, v: str) -> str:
     return _mask_email(v) if (rule or "").lower() == "email" else _mask_keep_rules(v)
@@ -175,6 +192,49 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     masked, hits = _apply_spans(s, all_allowed)
     return masked.encode("utf-8", "ignore"), hits
 
+def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
+    if not xml_bytes or not literals:
+        return xml_bytes
+
+    try:
+        s = xml_bytes.decode("utf-8", "ignore")
+    except Exception:
+        return xml_bytes
+
+    lits = [str(x) for x in literals if isinstance(x, str) and x.strip()]
+    if not lits:
+        return xml_bytes
+    lits = sorted(set(lits), key=lambda x: (-len(x), x))
+
+    def _mask_literal(v: str) -> str:
+        vv = (v or "").strip()
+        if "@" in vv and "." in vv.split("@", 1)[-1]:
+            return _mask_email(vv)
+        return _mask_keep_rules(vv)
+
+    def _apply_to_segment(seg: str) -> str:
+        out = seg
+        for lit in lits:
+            if not lit or len(lit) < 2:
+                continue
+            if lit in out:
+                out = out.replace(lit, _mask_literal(lit))
+        return out
+
+    # 텍스트 노드 영역만 치환
+    pieces: List[str] = []
+    last = 0
+    for m in _TEXT_NODE_RE.finditer(s):
+        pieces.append(s[last:m.start(1)])
+        pieces.append(_apply_to_segment(m.group(1)))
+        last = m.end(1)
+    pieces.append(s[last:])
+
+    out_s = "".join(pieces)
+    if out_s == s:
+        return xml_bytes
+    return out_s.encode("utf-8", "ignore")
+
 # 차트 라벨/값 마스킹(XML)
 def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     return sub_text_nodes(xml_bytes, comp)
@@ -183,7 +243,36 @@ def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
 def sanitize_docx_content_types(xml_bytes: bytes) -> bytes:
     return xml_bytes
 
-# XLSX 텍스트 수집(sharedStrings/worksheets/charts)
+# DOCX chart relationships(.rels) sanitize
+def chart_rels_sanitize(xml_bytes: bytes) -> bytes:
+    try:
+        s = xml_bytes.decode("utf-8", "ignore")
+        if ("TargetMode" not in s) and ("External" not in s) and ("http" not in s) and ("file:" not in s):
+            return xml_bytes
+
+        root = ET.fromstring(s)
+        removed = False
+        for rel in list(root):
+            try:
+                attrs = rel.attrib or {}
+                target_mode = (attrs.get("TargetMode") or attrs.get("targetMode") or "").strip().lower()
+                target = (attrs.get("Target") or attrs.get("target") or "").strip()
+                t_low = target.lower()
+                is_external = (target_mode == "external") or t_low.startswith(("http://", "https://", "file:", "mailto:"))
+                if is_external:
+                    root.remove(rel)
+                    removed = True
+            except Exception:
+                continue
+
+        if not removed:
+            return xml_bytes
+        out = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return out if isinstance(out, (bytes, bytearray)) else xml_bytes
+    except Exception:
+        return xml_bytes
+
+# XLSX 텍스트 수정
 def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
     out: List[str] = []
     try:

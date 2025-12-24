@@ -28,16 +28,30 @@ except Exception:
     )
 try:
     from ..core.schemas import XmlMatch, XmlLocation  # 현재 리포 구조
+except Exception:  # pragma: no cover
+    from server.core.schemas import XmlMatch, XmlLocation  # type: ignore
+
+
+log = logging.getLogger("pptx_module")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] pptx_module: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(logging.INFO)
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
+try:
+    from .ocr_image_redactor import redact_image_bytes
 except Exception:
     try:
-        from server.modules.ocr_image_redactor import redact_image_bytes
+        from server.modules.ocr_image_redactor import redact_image_bytes  # type: ignore
     except Exception:
-        redact_image_bytes = None
+        redact_image_bytes = None  # type: ignore
 
 
-# ─────────────────────────────────────────────────────────────
-# XML 태그/노이즈 제거 (text/extract 미리보기용 공통 정리)
-# ─────────────────────────────────────────────────────────────
+
+# XML 태그/노이즈 제거 (text/extract)
 _XML_TAG_RX = re.compile(r"(?s)<[^>]+>")
 
 def _clean_extracted_text(txt: str) -> str:
@@ -128,7 +142,106 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
         pos_count = len(pos_params)
 
     except Exception:
-        from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
+        sig = None
+        params = {}
+        has_varkw = False
+        comp_kw_name = None
+        pos_count = 0
+
+    last_err = None
+
+    def _normalize_ret(ret):
+        if isinstance(ret, tuple) and len(ret) == 2:
+            red, hit = ret
+            if isinstance(red, bytearray):
+                red = bytes(red)
+            if isinstance(red, bytes):
+                try:
+                    return red, int(hit)
+                except Exception:
+                    return red, -1
+            return None
+
+        if isinstance(ret, bytearray):
+            return bytes(ret), -1
+        if isinstance(ret, bytes):
+            return ret, -1
+        return None
+
+    # 1) (data, comp, **kwargs)
+    try:
+        if sig is None or has_varkw or pos_count >= 2:
+            ret = fn(data, comp, **kwargs)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 2) (data, **kwargs)
+    try:
+        ret = fn(data, **kwargs)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 3) (data)
+    try:
+        ret = fn(data)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 4) (data, rules/comp=<...>, **kwargs)
+    try:
+        if comp_kw_name is not None:
+            kw2 = dict(kwargs)
+            kw2[comp_kw_name] = comp
+            ret = fn(data, **kw2)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    raise TypeError(f"redact_image_bytes call failed: {last_err!r}")
+
+
+def _redact_image_bytes(data: bytes, comp, *, filename: str) -> Tuple[bytes, int]:
+    # PPTX 이미지 OCR 레닥션 (환경변수로 on/off)
+    if not _env_bool("PPTX_OCR_IMAGES", True):
+        return data, 0
+    if redact_image_bytes is None:
+        return data, 0
+
+    _ensure_ocr_env_compat("PPTX")
+    debug = _env_bool("PPTX_OCR_DEBUG", False)
+    try:
+        red, hit = _call_redact_image_bytes(
+            redact_image_bytes,
+            data,
+            comp,
+            filename=filename,
+            env_prefix="PPTX",
+            logger=log,
+            debug=debug,
+        )
+        return red, hit
+    except Exception:
+        # OCR 실패 시 원본 유지
+        return data, 0
 
 def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
     # 차트 XML + 임베디드 XLSX 텍스트 수집

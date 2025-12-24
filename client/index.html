@@ -5,16 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
 
-    <!-- Tailwind & PDF.js (전 디자인 유지) -->
+    <!-- Tailwind & PDF-->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
-    <!-- Markdown renderer + sanitizer (현재 app.js에서 사용) -->
+    <!-- Markdown renderer + sanitizer -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.3.1/dist/purify.min.js"></script>
 
     <script>
-      // API_BASE 자동 설정 (로컬/배포 공용)
+      // API_BASE 자동 설정
       const origin = window.location.origin
       window.API_BASE =
         origin.includes('127.0.0.1') || origin.includes('localhost')
