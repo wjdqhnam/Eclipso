@@ -738,17 +738,13 @@ def _overwrite_stream_in_ole(original_file_bytes: bytes, stream_name: str, new_s
 
 
 def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
-    """
-    .doc(OLE Compound File)에서 WordDocument 스트림을 "같은 길이"로 in-place 덮어쓴다.
 
-    기존 구현은 olefile의 write_mode/write_stream에 의존했는데, 환경에 따라 지원되지 않아
-    레닥션이 적용되지 않는 문제가 발생할 수 있어 OLE 파싱 기반 overwrite로 교체한다.
-    """
     try:
         return _overwrite_stream_in_ole(original_file_bytes, "WordDocument", new_word_data)
     except Exception as e:
         print(f"[ERR] OLE overwrite 중 오류: {e}")
         return original_file_bytes
+
 
 
 def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:

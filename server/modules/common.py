@@ -293,6 +293,49 @@ def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> by
         return xml_bytes
     return _xml_text_to_bytes(out_s, enc, bom)
 
+def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
+    if not xml_bytes or not literals:
+        return xml_bytes
+
+    try:
+        s = xml_bytes.decode("utf-8", "ignore")
+    except Exception:
+        return xml_bytes
+
+    lits = [str(x) for x in literals if isinstance(x, str) and x.strip()]
+    if not lits:
+        return xml_bytes
+    lits = sorted(set(lits), key=lambda x: (-len(x), x))
+
+    def _mask_literal(v: str) -> str:
+        vv = (v or "").strip()
+        if "@" in vv and "." in vv.split("@", 1)[-1]:
+            return _mask_email(vv)
+        return _mask_keep_rules(vv)
+
+    def _apply_to_segment(seg: str) -> str:
+        out = seg
+        for lit in lits:
+            if not lit or len(lit) < 2:
+                continue
+            if lit in out:
+                out = out.replace(lit, _mask_literal(lit))
+        return out
+
+    # 텍스트 노드 영역만 치환
+    pieces: List[str] = []
+    last = 0
+    for m in _TEXT_NODE_RE.finditer(s):
+        pieces.append(s[last:m.start(1)])
+        pieces.append(_apply_to_segment(m.group(1)))
+        last = m.end(1)
+    pieces.append(s[last:])
+
+    out_s = "".join(pieces)
+    if out_s == s:
+        return xml_bytes
+    return out_s.encode("utf-8", "ignore")
+
 # 차트 라벨/값 마스킹(XML)
 def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
     return sub_text_nodes(xml_bytes, comp)
