@@ -1,10 +1,5 @@
-from __future__ import annotations
-
-import io
-import os
-import struct
-import olefile
-from typing import List, Dict, Any, Tuple, Optional
+import io, os, struct, tempfile, olefile
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 from server.core.normalize import normalization_index
 from server.core.matching import find_sensitive_spans
@@ -16,6 +11,15 @@ LABELSST = 0x00FD
 HEADER = 0x0014
 FOOTER = 0x0015
 HEADERFOOTER = 0x089C
+BOF = 0x0809
+EOF = 0x000A
+BOUNDSHEET = 0x0085
+CODEPAGE = 0x0042
+NUMBER = 0x0203
+RK = 0x027E
+MULRK = 0x00BD
+BOOLERR = 0x0205
+FORMULA = 0x0006
 
 
 def le16(b, off=0) -> int:
@@ -31,15 +35,168 @@ def iter_biff_records(data: bytes):
     while off + 4 <= n:
         opcode, length = struct.unpack_from("<HH", data, off)
         header_off = off
-        off += 4
-        payload = data[off : off + length]
+        off += 4        
+        payload = data[off:off + length]
         off += length
         yield opcode, length, payload, header_off
 
 
-# ───────────────────────────────────────────────
+def iter_biff_records_from(data: bytes, start_off: int):
+    off, n = int(start_off), len(data)
+    while off + 4 <= n:
+        opcode, length = struct.unpack_from("<HH", data, off)
+        header_off = off
+        off += 4
+        payload = data[off:off + length]
+        off += length
+        yield opcode, length, payload, header_off
+
+
+def _escape_html(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _cell_to_html(cell: str) -> str:
+    s = (cell or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _escape_html(s).replace("\n", "<br/>")
+
+
+def _rows_to_html_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    w = max((len(r) for r in rows), default=0)
+    rect = [list(r) + [""] * (w - len(r)) for r in rows]
+    out: List[str] = []
+    out.append("<table>")
+    out.append("<tbody>")
+    for r in rect:
+        out.append("<tr>")
+        for c in r:
+            out.append(f"<td>{_cell_to_html(c)}</td>")
+        out.append("</tr>")
+    out.append("</tbody>")
+    out.append("</table>")
+    return "\n".join(out)
+
+
+def _parse_boundsheets(wb: bytes) -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    for opcode, length, payload, hdr in iter_biff_records(wb):
+        if opcode != BOUNDSHEET:
+            continue
+        if len(payload) < 8:
+            continue
+        off = le32(payload, 0)
+        name_len = payload[6]
+        flags = payload[7]
+        name_bytes = payload[8:8 + (name_len * (2 if (flags & 0x01) else 1))]
+        try:
+            if flags & 0x01:
+                name = name_bytes.decode("utf-16le", errors="ignore")
+            else:
+                name = name_bytes.decode("latin1", errors="ignore")
+        except Exception:
+            name = f"Sheet@{off}"
+        out.append((name or f"Sheet@{off}", int(off)))
+    return out
+
+
+def _extract_sheet_grid(wb: bytes, strings: List[str], sheet_off: int, max_rows: int = 200, max_cols: int = 50) -> List[List[str]]:
+
+    cells: Dict[int, Dict[int, str]] = {}
+    max_r = 0
+    max_c = 0
+
+    for opcode, length, payload, hdr in iter_biff_records_from(wb, sheet_off):
+        if opcode == EOF:
+            break
+        try:
+            if opcode == LABELSST and len(payload) >= 10:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                sst_idx = le32(payload, 6)
+                v = strings[sst_idx] if 0 <= sst_idx < len(strings) else ""
+                if v:
+                    cells.setdefault(r + 1, {})[c + 1] = v
+                    max_r = max(max_r, r + 1)
+                    max_c = max(max_c, c + 1)
+            elif opcode == NUMBER and len(payload) >= 14:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                if r + 1 > max_rows or c + 1 > max_cols:
+                    continue
+                val = struct.unpack_from("<d", payload, 6)[0]
+                v = str(int(val)) if abs(val - int(val)) < 1e-9 else str(val)
+                cells.setdefault(r + 1, {})[c + 1] = v
+                max_r = max(max_r, r + 1)
+                max_c = max(max_c, c + 1)
+            elif opcode == LABEL and len(payload) >= 8:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                if r + 1 > max_rows or c + 1 > max_cols:
+                    continue
+                cch = le16(payload, 6)
+                raw = payload[8:8 + cch]
+                try:
+                    v = raw.decode("latin1", errors="ignore")
+                except Exception:
+                    v = ""
+                if v:
+                    cells.setdefault(r + 1, {})[c + 1] = v
+                    max_r = max(max_r, r + 1)
+                    max_c = max(max_c, c + 1)
+        except Exception:
+            continue
+
+    if not cells:
+        return []
+
+    rows: List[List[str]] = []
+    for r in range(1, max_r + 1):
+        row = [cells.get(r, {}).get(c, "") for c in range(1, max_c + 1)]
+        if any(x.strip() for x in row):
+            rows.append(row)
+    return rows
+
+
+def extract_markdown_tables_from_xls(file_bytes: bytes) -> str:
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            if not ole.exists("Workbook"):
+                return ""
+            wb = ole.openstream("Workbook").read()
+    except Exception:
+        return ""
+
+    blocks = get_sst_blocks(wb)
+    if blocks:
+        xlucs_list = SSTParser(blocks).parse()
+        strings = [x.text for x in xlucs_list]
+    else:
+        strings = []
+
+    sheets = _parse_boundsheets(wb)
+    if not sheets:
+        return ""
+
+    out: List[str] = []
+    for name, off in sheets:
+        rows = _extract_sheet_grid(wb, strings, off)
+        if not rows:
+            continue
+        out.append(f"**Sheet: {_escape_html(name)}**")
+        out.append(_rows_to_html_table(rows))
+        out.append("")
+    return "\n\n".join(out).strip()
+
 # 본문 SST + CONTINUE 부분
-# ───────────────────────────────────────────────
 def get_sst_blocks(wb: bytes) -> Optional[List[Tuple[bytes, int]]]:
     blocks: List[Tuple[bytes, int]] = []
     found = False
@@ -93,7 +250,6 @@ class SSTParser:
         self.pos = 0
         self.cur_abs = abs_off
 
-        # 문자열이 CONTINUE로 이어질 때: 첫 1바이트는 인코딩 플래그가 끼어드는 경우가 있으므로 소비
         if self.reading_text and len(payload) > 0:
             self.pos = 1
             self.cur_abs += 1
@@ -141,7 +297,6 @@ class SSTParser:
             chunk = payload[self.pos : self.pos + take]
             out.extend(chunk)
 
-            # 각 바이트의 "Workbook 절대 오프셋" 기록 (CONTINUE 대응 패치용)
             for i in range(take):
                 pos_list.append(start_abs + i)
 
@@ -303,6 +458,8 @@ def extract_text(file_bytes: bytes):
         else:
             strings = []
 
+        
+        # 본문 텍스트
         body = extract_sst(wb, strings)
 
         header_texts: List[str] = []
@@ -317,13 +474,18 @@ def extract_text(file_bytes: bytes):
                     if item["text"]:
                         header_texts.append(item["text"])
 
+        
+        # 전체 합치기
         combined_texts = body + header_texts
         full_text = "\n".join(combined_texts)
+        md = extract_markdown_tables_from_xls(file_bytes)
 
         return {
             "body": body,
             "header_footer": header_texts,
             "full_text": full_text,
+            
+            "markdown": md if isinstance(md, str) and md.strip() else full_text,
             "pages": [{"page": 1, "text": full_text}],
         }
 
@@ -339,18 +501,40 @@ def mask_except_hypen(orig_segment: str) -> str:
     return "".join(out_chars)
 
 
-def redact_xlucs(text: str) -> str:
+def redact_xlucs(text: str, extra_literals: Optional[List[str]] = None) -> str:
     if not text:
         return text
 
     norm_text, index_map = normalization_index(text)
 
     spans = find_sensitive_spans(norm_text)
-    if not spans:
-        return text
+    spans = spans or []
+
+    # NER/스팬 기반 리터럴도 동일 길이로 추가 마스킹
+    lits = [str(x).strip() for x in (extra_literals or []) if str(x).strip()]
+    lits = sorted(set([x for x in lits if len(x) >= 2]), key=lambda x: (-len(x), x))
 
     chars = list(text)
     spans = sorted(spans, key=lambda x: x[0], reverse=True)
+
+    # 0) 리터럴 우선(부분 문자열 충돌 방지)
+    if lits:
+        for lit in lits:
+            masked = mask_except_hypen(lit)
+            if not lit or lit not in text:
+                continue
+            # 뒤에서부터 치환(인덱스 안정)
+            start = 0
+            while True:
+                pos = text.find(lit, start)
+                if pos == -1:
+                    break
+                start = pos + 1
+                # 기록
+                s = pos
+                e = pos + len(lit)
+                for i, ch in enumerate(masked):
+                    chars[s + i] = ch
 
     for s_norm, e_norm, _value, _rule in spans:
         s = index_map.get(s_norm)
@@ -371,14 +555,14 @@ def redact_xlucs(text: str) -> str:
     return "".join(chars)
 
 
-def redact_hdr_fdr(wb: bytearray) -> None:
+def redact_hdr_fdr(wb: bytearray, extra_literals: Optional[List[str]] = None) -> None:
     for opcode, length, payload, hdr in iter_biff_records(wb):
         if opcode in (HEADER, FOOTER):
             text, _cch, fHigh, _next_off, _raw_len = parse_xlucs(payload, 0)
             if not text:
                 continue
 
-            new_text = redact_xlucs(text)
+            new_text = redact_xlucs(text, extra_literals=extra_literals)
             if len(new_text) != len(text):
                 raise ValueError("Header/Footer 레닥션 길이 불일치")
 
@@ -400,7 +584,7 @@ def redact_hdr_fdr(wb: bytearray) -> None:
                 if not text:
                     continue
 
-                new_text = redact_xlucs(text)
+                new_text = redact_xlucs(text, extra_literals=extra_literals)
                 if len(new_text) != len(text):
                     raise ValueError("HEADERFOOTER 레닥션 길이 불일치")
 
@@ -431,8 +615,21 @@ def overlay_workbook_stream(file_bytes: bytes, orig_wb: bytes, new_wb: bytes) ->
     return bytes(full)
 
 
-def redact(file_bytes: bytes) -> bytes:
+def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
     print("[INFO] XLS Redaction 시작")
+
+    extra_literals: List[str] = []
+    if spans and isinstance(spans, list):
+        for sp in spans:
+            if not isinstance(sp, dict):
+                continue
+            t = sp.get("text")
+            if t is None:
+                continue
+            v = str(t).strip()
+            if len(v) >= 2:
+                extra_literals.append(v)
+    extra_literals = sorted(set(extra_literals), key=lambda x: (-len(x), x))
 
     with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
         if not ole.exists("Workbook"):
@@ -449,7 +646,7 @@ def redact(file_bytes: bytes) -> bytes:
     xlucs_list = SSTParser(blocks).parse()
 
     for x in xlucs_list:
-        red_text = redact_xlucs(x.text)
+        red_text = redact_xlucs(x.text, extra_literals=extra_literals)
 
         if len(red_text) != len(x.text):
             raise ValueError("동일길이 레닥션 실패 (문자 수 불일치)")
@@ -465,7 +662,7 @@ def redact(file_bytes: bytes) -> bytes:
 
     print("[OK] SST 텍스트 레닥션 완료")
 
-    redact_hdr_fdr(wb)
+    redact_hdr_fdr(wb, extra_literals=extra_literals)
     print("[OK] 헤더/푸터 텍스트 레닥션 완료")
 
     return overlay_workbook_stream(file_bytes, orig_wb, bytes(wb))

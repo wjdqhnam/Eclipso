@@ -8,7 +8,6 @@ import logging
 import inspect
 from typing import List, Tuple, Optional
 
-# 공통 유틸 (상대 import 우선, 실패 시 절대 import)
 try:
     from .common import (
         cleanup_text,
@@ -27,35 +26,35 @@ except Exception:
         xlsx_text_from_zip,
         redact_embedded_xlsx_bytes,
     )
+try:
+    from ..core.schemas import XmlMatch, XmlLocation  # 현재 리포 구조
+except Exception:  # pragma: no cover
+    from server.core.schemas import XmlMatch, XmlLocation  # type: ignore
 
-from server.core.schemas import XmlMatch, XmlLocation
 
-log = logging.getLogger("xml_redaction")
+log = logging.getLogger("pptx_module")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] pptx_module: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(logging.INFO)
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
-# 이미지 OCR 레닥션 엔진(있으면 사용, 없으면 skip)
 try:
     from .ocr_image_redactor import redact_image_bytes
 except Exception:
     try:
-        from server.modules.ocr_image_redactor import redact_image_bytes
+        from server.modules.ocr_image_redactor import redact_image_bytes  # type: ignore
     except Exception:
-        redact_image_bytes = None
+        redact_image_bytes = None  # type: ignore
 
 
-# ─────────────────────────────────────────────────────────────
-# XML 태그/노이즈 제거 (text/extract 미리보기용 공통 정리)
-# ─────────────────────────────────────────────────────────────
+
+# XML 태그/노이즈 제거 (text/extract)
 _XML_TAG_RX = re.compile(r"(?s)<[^>]+>")
 
 def _clean_extracted_text(txt: str) -> str:
-    """
-    PPTX의 chart/xml 등에서 raw 태그 덩어리가 섞여 들어오는 문제 방지용.
-    - 태그 제거
-    - '<' '>' 남아있는 라인 통째 삭제
-    - 차트/임베디드에서 튀는 엑셀 참조/formatCode 노이즈 제거
-    """
     if not txt:
         return ""
 
@@ -83,7 +82,6 @@ def _clean_extracted_text(txt: str) -> str:
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    # env flag 읽기
     v = os.getenv(key)
     if v is None:
         return default
@@ -105,7 +103,6 @@ def _ensure_ocr_env_compat(env_prefix: str):
 
 
 def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix: str, logger, debug: bool):
-    # redact_image_bytes 시그니처 차이(버전별) 흡수 + (bytes, hit) / bytes 반환 모두 처리
     kwargs = {}
     try:
         sig = inspect.signature(fn)
@@ -146,6 +143,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
 
     except Exception:
         sig = None
+        params = {}
         has_varkw = False
         comp_kw_name = None
         pos_count = 0
@@ -163,6 +161,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
                 except Exception:
                     return red, -1
             return None
+
         if isinstance(ret, bytearray):
             return bytes(ret), -1
         if isinstance(ret, bytes):
@@ -203,7 +202,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
     except Exception as e:
         last_err = e
 
-    # 4) (data, comp=<...>/rules=<...>, **kwargs)
+    # 4) (data, rules/comp=<...>, **kwargs)
     try:
         if comp_kw_name is not None:
             kw2 = dict(kwargs)
@@ -220,44 +219,29 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
     raise TypeError(f"redact_image_bytes call failed: {last_err!r}")
 
 
-def _redact_image_bytes(image_bytes: bytes, comp, *, filename: str) -> Tuple[bytes, int]:
-    # PPTX 이미지 → OCR 레닥션(가능한 경우만)
-    if redact_image_bytes is None:
-        log.warning("[PPTX][IMG][OCR] ocr_image_redactor not available -> skip (%s)", filename)
-        return image_bytes, 0
-
+def _redact_image_bytes(data: bytes, comp, *, filename: str) -> Tuple[bytes, int]:
+    # PPTX 이미지 OCR 레닥션 (환경변수로 on/off)
     if not _env_bool("PPTX_OCR_IMAGES", True):
-        log.info("[PPTX][IMG][OCR] disabled by env (PPTX_OCR_IMAGES=0) image=%s", filename)
-        return image_bytes, 0
+        return data, 0
+    if redact_image_bytes is None:
+        return data, 0
 
     _ensure_ocr_env_compat("PPTX")
-
     debug = _env_bool("PPTX_OCR_DEBUG", False)
-
     try:
         red, hit = _call_redact_image_bytes(
             redact_image_bytes,
-            image_bytes,
+            data,
             comp,
             filename=filename,
             env_prefix="PPTX",
             logger=log,
             debug=debug,
         )
-        changed = (red != image_bytes)
-        log.info(
-            "[PPTX][IMG][OCR] end image=%s in=%d out=%d changed=%s hit=%s",
-            filename,
-            len(image_bytes),
-            len(red),
-            changed,
-            hit,
-        )
         return red, hit
-    except Exception as e:
-        log.exception("[PPTX][IMG][OCR] failed image=%s err=%r", filename, e)
-        return image_bytes, 0
-
+    except Exception:
+        # OCR 실패 시 원본 유지
+        return data, 0
 
 def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
     # 차트 XML + 임베디드 XLSX 텍스트 수집
@@ -297,7 +281,7 @@ def _collect_chart_and_embedded_texts(zipf: zipfile.ZipFile) -> str:
         except zipfile.BadZipFile:
             continue
 
-    # ✅ 여기서 한 번 정리(태그/노이즈 제거) → 미리보기로 raw 태그가 새지 않게
+    # 여기서 한 번 정리(태그/노이즈 제거) → 미리보기로 raw 태그가 새지 않게
     return _clean_extracted_text("\n".join(p for p in parts if p))
 
 
@@ -324,15 +308,21 @@ def pptx_text(zipf: zipfile.ZipFile) -> str:
     if chart_txt:
         all_txt.append(chart_txt)
 
-    # ✅ 최종 합친 뒤에도 한 번 더 정리
+    # 최종 합친 뒤에도 한 번 더 정리
     return _clean_extracted_text("\n".join(all_txt))
 
 
 def extract_text(file_bytes: bytes) -> dict:
-    # /text/extract용
+    
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         txt = pptx_text(zipf)
-    return {"full_text": txt, "pages": [{"page": 1, "text": txt}]}
+
+    return {
+        "full_text": txt,
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
+    }
 
 
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:

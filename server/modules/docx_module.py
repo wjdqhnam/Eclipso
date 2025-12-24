@@ -8,18 +8,41 @@ import os
 import inspect
 from typing import List, Tuple
 
-from .common import (
-    cleanup_text,
-    compile_rules,
-    sub_text_nodes,
-    chart_sanitize,
-    xlsx_text_from_zip,
-    redact_embedded_xlsx_bytes,
-    sanitize_docx_content_types,
-)
-from server.core.schemas import XmlMatch, XmlLocation
+try:
+    from .common import (
+        cleanup_text,
+        compile_rules,
+        sub_text_nodes,
+        chart_sanitize,
+        xlsx_text_from_zip,
+        redact_embedded_xlsx_bytes,
+        chart_rels_sanitize,
+        sanitize_docx_content_types,
+    )
+except Exception:  # pragma: no cover - 구조가 달라졌을 때 대비
+    from server.modules.common import (  # type: ignore
+        cleanup_text,
+        compile_rules,
+        sub_text_nodes,
+        chart_sanitize,
+        xlsx_text_from_zip,
+        redact_embedded_xlsx_bytes,
+        chart_rels_sanitize,
+        sanitize_docx_content_types,
+    )
 
-log = logging.getLogger("xml_redaction")
+# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
+try:
+    from ..core.schemas import XmlMatch, XmlLocation
+except Exception:  # pragma: no cover
+    from server.core.schemas import XmlMatch, XmlLocation  # type: ignore
+
+log = logging.getLogger("docx_module")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] docx_module: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(logging.INFO)
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
@@ -40,8 +63,9 @@ def _env_bool(key: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-# redact_image_bytes 함수 시그니처가 달라도 최대한 호환되게 호출하는 래퍼
+
 def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix: str, logger, debug: bool):
+
     kwargs = {}
     try:
         sig = inspect.signature(fn)
@@ -57,11 +81,9 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
         _set_kw("filename", filename)
         _set_kw("name", filename)
         _set_kw("path", filename)
-
         _set_kw("env_prefix", env_prefix)
         _set_kw("prefix", env_prefix)
         _set_kw("env", env_prefix)
-
         _set_kw("logger", logger)
         _set_kw("log", logger)
 
@@ -92,7 +114,6 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
     last_err = None
 
     def _normalize_ret(ret):
-        # (bytes, hit) 형태면 그대로 정규화
         if isinstance(ret, tuple) and len(ret) == 2:
             red, hit = ret
             if isinstance(red, bytearray):
@@ -104,15 +125,13 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
                     return red, -1
             return None
 
-        # bytes만 오면 hit 카운트는 없음(-1)
         if isinstance(ret, bytearray):
             return bytes(ret), -1
         if isinstance(ret, bytes):
             return ret, -1
-
         return None
 
-    # 1) fn(data, comp, **kwargs) 시도
+    # 1) (data, comp, **kwargs)
     try:
         if sig is None or has_varkw or pos_count >= 2:
             ret = fn(data, comp, **kwargs)
@@ -124,7 +143,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
     except Exception as e:
         last_err = e
 
-    # 2) fn(data, **kwargs) 시도
+    # 2) (data, **kwargs)
     try:
         ret = fn(data, **kwargs)
         nr = _normalize_ret(ret)
@@ -135,7 +154,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
     except Exception as e:
         last_err = e
 
-    # 3) fn(data) 시도
+    # 3) (data)
     try:
         ret = fn(data)
         nr = _normalize_ret(ret)
@@ -146,7 +165,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
     except Exception as e:
         last_err = e
 
-    # 4) fn(data, rules/comp=<...>, **kwargs) 형태 시도
+    # 4) (data, rules/comp=<...>, **kwargs)
     try:
         if comp_kw_name is not None:
             kw2 = dict(kwargs)
@@ -162,9 +181,7 @@ def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix
 
     raise TypeError(f"redact_image_bytes call failed: {last_err!r}")
 
-
-# DOCX 내부 차트/임베디드 XLSX에서 텍스트를 뽑아 본문과 중복 제거 후 합치기
-def _collect_chart_texts(zipf: zipfile.ZipFile, main_seen: set[str]) -> str:
+def _collect_chart_texts(zipf: zipfile.ZipFile) -> str:
     parts: List[str] = []
 
     for name in sorted(
@@ -206,65 +223,35 @@ def _collect_chart_texts(zipf: zipfile.ZipFile, main_seen: set[str]) -> str:
         except zipfile.BadZipFile:
             continue
 
-    filtered: List[str] = []
-    seen_chart: set[str] = set()
-
-    for line in cleanup_text("\n".join(parts)).splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if "<c:" in s:
-            continue
-        # 차트 기본 라벨(자동 생성된 항목/계열)은 제외
-        if re.fullmatch(r"항목\s*\d+", s):
-            continue
-        if re.fullmatch(r"계열\s*\d+", s):
-            continue
-        # 본문에 이미 있는 텍스트는 중복 제거
-        if s in main_seen:
-            continue
-        if s in seen_chart:
-            continue
-        seen_chart.add(s)
-        filtered.append(s)
-
-    return "\n".join(filtered)
-
-
-# DOCX 텍스트(본문 + 차트/임베디드) 하나로 합쳐 반환
+    return cleanup_text("\n".join(p for p in parts if p))
 def docx_text(zipf: zipfile.ZipFile) -> str:
     try:
-        xml = zipf.read("word/document.xml").decode("utf-8", "ignore")
+        xml_bytes = zipf.read("word/document.xml")
     except KeyError:
-        xml = ""
+        xml_bytes = b""
 
-    main_lines: List[str] = []
-    for p_xml in re.finditer(r"<w:p[^>]*>(.*?)</w:p>", xml, re.DOTALL):
-        body = p_xml.group(1)
-        text_in_p = "".join(
-            m.group(1) for m in re.finditer(r"<w:t[^>]*>(.*?)</w:t>", body, re.DOTALL)
-        )
-        text_in_p = cleanup_text(text_in_p)
-        if text_in_p:
-            main_lines.append(text_in_p)
+    xml = xml_bytes.decode("utf-8", "ignore")
+    text_main = "".join(
+        m.group(1) for m in re.finditer(r"<w:t[^>]*>(.*?)</w:t>", xml, re.DOTALL)
+    )
+    text_main = cleanup_text(text_main)
 
-    main_text = "\n".join(main_lines)
-    main_seen = {ln.strip() for ln in main_lines if ln.strip()}
+    # 차트 + 임베디드 XLSX
+    text_charts = _collect_chart_texts(zipf)
 
-    chart_text = _collect_chart_texts(zipf, main_seen)
-    merged = "\n".join([main_text, chart_text] if chart_text else [main_text])
+    return cleanup_text("\n".join(x for x in [text_main, text_charts] if x))
 
-    return cleanup_text(merged)
-
-
-# /text/extract 용: DOCX의 전체 텍스트를 1페이지로 리턴
 def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
         txt = docx_text(zipf)
-    return {"full_text": txt, "pages": [{"page": 1, "text": txt}]}
+    return {
+        "full_text": txt,
+        "pages": [
+            {"page": 1, "text": txt},
+        ],
+    }
 
 
-# /text/scan 용: 규칙(정규식)으로 전체 텍스트에서 매칭을 만들어냄
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     text = docx_text(zipf)
     comp = compile_rules()
@@ -298,8 +285,6 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 
     return out, "docx", text
 
-
-# DOCX 내부 파일 1개를 받아서(경로 기준) 텍스트/차트/임베디드/이미지 레닥션 적용
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
     log.info(
@@ -311,6 +296,10 @@ def redact_item(filename: str, data: bytes, comp):
 
     if low == "[content_types].xml":
         return sanitize_docx_content_types(data)
+
+    # 차트 관계(rels) 중 외부 링크 제거
+    if low.startswith("word/charts/_rels/") and low.endswith(".rels"):
+        return chart_rels_sanitize(data)
 
     if low == "word/document.xml":
         return sub_text_nodes(data, comp)[0]
@@ -383,7 +372,6 @@ def redact_item(filename: str, data: bytes, comp):
     return data
 
 
-# DOCX에서 word/media/* 이미지들만 추출해서 (경로, bytes) 리스트로 반환
 def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
     out: List[Tuple[str, bytes]] = []
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:

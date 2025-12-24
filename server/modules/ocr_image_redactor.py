@@ -564,10 +564,6 @@ def _shrink_bbox_by_substring(block_text: str, value: str, bbox: List[float]) ->
 
 
 def _tighten_overwide_bbox(text: str, bbox: List[float], *, char_px_factor: float, slack: float) -> List[float]:
-    """
-    EasyOCR가 bbox를 '라인 전체'로 크게 주는 경우가 있어서,
-    텍스트 길이(가중치)와 높이로 '기대 폭'을 계산해 과도하게 넓은 bbox를 줄인다.
-    """
     try:
         x0, y0, x1, y1 = map(float, bbox)
     except Exception:
@@ -623,15 +619,12 @@ def detect_sensitive_ocr_blocks(
     pass3 = _env_bool(f"{env_prefix}_OCR_UPSCALE_PASS", True)
     upscale = _env_float(f"{env_prefix}_OCR_UPSCALE", 2.0)
 
-    # ✅ GPU: env로 강제 지정 가능 + 없으면 자동 false
     gpu_env = os.getenv(f"{env_prefix}_OCR_GPU")
     if gpu_env is None:
         gpu = _torch_cuda_available()  # 자동 감지
     else:
         gpu = _env_bool(f"{env_prefix}_OCR_GPU", False) and _torch_cuda_available()
 
-    # ✅ CPU일 때 너무 느리면 업스케일 패스를 자동으로 줄이기(큰 이미지에서 체감 큼)
-    #    - 기본 동작은 유지하되, "큰 이미지 + CPU"면 pass3만 자동 off
     max_px_for_upscale = _env_int(f"{env_prefix}_OCR_MAX_PX_FOR_UPSCALE", 2200000)  # ~1920x1146 정도
     if (not gpu) and pass3:
         try:
@@ -710,7 +703,7 @@ def detect_sensitive_ocr_blocks(
         if rule is None:
             rule, val = _match_text_to_rules(txt, comp, candidates=None)
 
-        # ✅ 이메일 강제 fallback
+        # 이메일 강제 fallback
         if rule is None:
             em = _fallback_find_email(txt)
             if em:
@@ -759,18 +752,13 @@ def redact_image_bytes(
         # gpu=True를 줘도 실제 CUDA 없으면 내부에서 자동 false로 떨어짐
         os.environ[f"{env_prefix}_OCR_GPU"] = "1" if gpu else "0"
 
-    # ✅ 박스 길이(가로) 전체적으로 더 키우기
-    #    - 기본값을 기존보다 확실히 올림
-    #    - 오른쪽이 더 짧아 튀어나오는 케이스가 많아서 XR 기본을 크게
     pad_y = _env_float(f"{env_prefix}_OCR_PAD_Y", 0.10)
     pad_x_left = _env_float(f"{env_prefix}_OCR_PAD_XL", 0.06)
     pad_x_right = _env_float(f"{env_prefix}_OCR_PAD_XR", 0.18)
 
-    # ✅ "전체 라인 통가림" 완화용: bbox가 과도하게 넓을 때 텍스트 길이 기반으로 줄이기
     char_px_factor = _env_float(f"{env_prefix}_OCR_CHAR_PX_FACTOR", 0.55)
     overwide_slack = _env_float(f"{env_prefix}_OCR_OVERWIDE_SLACK", 0.35)
 
-    # ✅ 추가로 '민감항목'은 박스 길이를 조금 더 길게(여권/면허/이메일/카드 등)
     extra_x_sensitive = _env_float(f"{env_prefix}_OCR_EXTRA_X_SENSITIVE", 0.12)  # 픽셀 단위가 아니라 "높이*h"로 적용
     extra_x_card = _env_float(f"{env_prefix}_OCR_EXTRA_X_CARD", 0.18)
     extra_x_email = _env_float(f"{env_prefix}_OCR_EXTRA_X_EMAIL", 0.16)

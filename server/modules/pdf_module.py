@@ -1,415 +1,472 @@
 from __future__ import annotations
 
 import io
+import os
 import re
-from typing import List, Optional, Set, Dict, Any
-
-import fitz  # PyMuPDF
-import pymupdf4llm
 import logging
+import tempfile
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import fitz
+
+try:
+    import pymupdf4llm  # type: ignore
+except Exception:
+    pymupdf4llm = None  # type: ignore
 
 from server.core.schemas import Box, PatternItem
 from server.core.redaction_rules import PRESET_PATTERNS
-from server.modules.ner_module import run_ner
 from server.core.regex_utils import match_text
 
-from server.modules.ocr_module import easyocr_blocks
-from server.modules.ocr_qwen_post import classify_blocks_with_qwen
-from PIL import Image
+try:
+    from server.modules.common import cleanup_text
+except Exception:  # pragma: no cover
+    from ..modules.common import cleanup_text  # type: ignore
+
+# Optional OCR deps
+try:
+    from server.modules.ocr_module import easyocr_blocks  # type: ignore
+except Exception:
+    easyocr_blocks = None  # type: ignore
+
+try:
+    from server.modules.ocr_qwen_post import classify_blocks_with_qwen  # type: ignore
+except Exception:
+    classify_blocks_with_qwen = None  # type: ignore
+
+try:
+    from PIL import Image  # type: ignore
+except Exception:
+    Image = None  # type: ignore
 
 
 log_prefix = "[PDF]"
 logger = logging.getLogger(__name__)
 
 
+def _pdf_extract_debug_enabled() -> bool:
+    return os.getenv("ECLIPSO_PDF_EXTRACT_DEBUG", "0") == "1"
+
+
+def _vis_ws(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.replace("\r", "\\r")
+    s = s.replace("\t", "\\t")
+    s = s.replace("\n", "\\n\n")
+    return s
+
+
+def _compact_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ")).strip()
+
+
+# (/text/extract)
 def extract_text(file_bytes: bytes) -> dict:
-    # PDF 텍스트 레이어를 page별/전체로 추출 (/text/extract)
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
-        pages = []
+        pages: List[dict] = []
         all_chunks: List[str] = []
-
         for idx, page in enumerate(doc):
             raw = page.get_text("text") or ""
             cleaned = raw.replace("\r", "")
             pages.append({"page": idx + 1, "text": cleaned})
-            if cleaned:
-                all_chunks.append(cleaned)
-
-        full_text = "\n\n".join(all_chunks)
-
+            all_chunks.append(cleaned)
+        full_text = "\n\n".join(all_chunks).strip()
         return {"full_text": full_text, "pages": pages}
     finally:
         doc.close()
 
 
-def extract_table_layout(pdf_bytes: bytes) -> dict:
-    # PyMuPDF table finder로 표 bbox/행/열 개수만 수집
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    tables: List[dict] = []
+def _group_words_to_lines(words: list, y_tol: float = 2.0) -> list[list]:
+    if not words:
+        return []
+    ws = []
+    for w in words:
+        try:
+            x0, y0, x1, y1, txt = w[0], w[1], w[2], w[3], w[4]
+        except Exception:
+            continue
+        if not txt:
+            continue
+        yc = (float(y0) + float(y1)) / 2.0
+        ws.append((yc, float(x0), float(x1), float(y0), float(y1), str(txt)))
+    ws.sort(key=lambda t: (t[0], t[1]))
 
-    try:
-        for page_idx, page in enumerate(doc):
-            finder = page.find_tables()
-            if not finder or not finder.tables:
+    lines: list[list] = []
+    cur: list = []
+    cur_y: Optional[float] = None
+    for yc, x0, x1, y0, y1, txt in ws:
+        if cur_y is None or abs(yc - cur_y) <= y_tol:
+            cur.append((x0, x1, y0, y1, txt))
+            cur_y = yc if cur_y is None else (cur_y + yc) / 2.0
+        else:
+            lines.append(cur)
+            cur = [(x0, x1, y0, y1, txt)]
+            cur_y = yc
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _append_token(
+    out_chars: list,
+    out_text_parts: list,
+    token: str,
+    bbox: Tuple[float, float, float, float] | None,
+    line_id: int,
+) -> None:
+    if not token:
+        return
+    out_text_parts.append(token)
+    for _ch in token:
+        out_chars.append({"bbox": bbox, "line_id": line_id})
+
+
+def _words_lines_to_text_and_chars(
+    lines: list[list],
+    *,
+    join_lines_with_space: bool,
+    gap_x_tol: float = 1.5,
+    line_id_start: int = 0,
+    line_sep_override: str | None = None,
+) -> Tuple[str, list, int]:
+    out_parts: list[str] = []
+    out_chars: list[dict] = []
+    line_id = line_id_start
+
+    for li, line in enumerate(lines):
+        line_sorted = sorted(line, key=lambda t: t[0])
+        prev_x1: float | None = None
+        for _wi, (x0, x1, y0, y1, txt) in enumerate(line_sorted):
+            bbox = (float(x0), float(y0), float(x1), float(y1))
+
+            if prev_x1 is not None:
+                if float(x0) - float(prev_x1) > float(gap_x_tol):
+                    _append_token(out_chars, out_parts, " ", None, line_id)
+
+            _append_token(out_chars, out_parts, txt, bbox, line_id)
+            prev_x1 = float(x1)
+
+        if li != len(lines) - 1:
+            sep = line_sep_override if line_sep_override is not None else (" " if join_lines_with_space else "\n")
+            _append_token(out_chars, out_parts, sep, None, line_id)
+            if sep == "\n":
+                line_id += 1
+
+    return ("".join(out_parts), out_chars, line_id + 1)
+
+
+def _table_to_text_and_chars(page: fitz.Page, table: Any, line_id_start: int = 0) -> Tuple[str, list, int]:
+    out_parts: list[str] = []
+    out_chars: list[dict] = []
+    line_id = line_id_start
+
+    rows = getattr(table, "rows", None)
+    if not rows:
+        try:
+            extracted = table.extract()
+        except Exception:
+            extracted = None
+
+        if extracted:
+            for row in extracted:
+                for cell_txt in row:
+                    cell_s = str(cell_txt or "")
+                    _append_token(out_chars, out_parts, cell_s, None, line_id)
+                    _append_token(out_chars, out_parts, "\n", None, line_id)
+                    line_id += 1
+            return ("".join(out_parts), out_chars, line_id)
+
+        return ("", [], line_id_start)
+
+    for row in rows:
+        cells = getattr(row, "cells", None) or []
+        for cell in cells:
+            if not cell:
                 continue
+            rect = fitz.Rect(cell)
+            words = page.get_text("words", clip=rect) or []
+            lines = _group_words_to_lines(words, y_tol=2.0)
+            cell_text, cell_chars, _ = _words_lines_to_text_and_chars(
+                lines,
+                join_lines_with_space=True,
+                gap_x_tol=1.5,
+                line_id_start=line_id,
+                line_sep_override="",
+            )
+            out_parts.append(cell_text)
+            out_chars.extend(cell_chars)
+            _append_token(out_chars, out_parts, "\n", None, line_id)
+            line_id += 1
 
-            for t in finder.tables:
-                rect = fitz.Rect(t.bbox)
-                tables.append(
-                    {
-                        "page": page_idx + 1,
-                        "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
-                        "row_count": t.row_count,
-                        "col_count": t.col_count,
-                    }
-                )
-    finally:
-        doc.close()
-
-    return {"tables": tables}
+    return ("".join(out_parts), out_chars, line_id)
 
 
-def extract_markdown(pdf_bytes: bytes, by_page: bool = True) -> dict:
-    # pymupdf4llm 기반 마크다운 추출 (/text/markdown)
+def extract_text_indexed(pdf_bytes: bytes) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        if by_page:
-            chunks = pymupdf4llm.to_markdown(doc=doc, page_chunks=True)
-            pages: List[dict] = []
+        full_parts: list[str] = []
+        full_chars: list[dict] = []
+        pages_out: list[dict] = []
 
-            for idx, ch in enumerate(chunks, start=1):
-                meta = ch.get("metadata", {}) or {}
-                page_no = meta.get("page_number") or idx
+        offset = 0
+        global_line_id = 0
 
-                md = (ch.get("text") or "").replace("<br>", "")
-                raw_tables = ch.get("tables", []) or []
-                tables: List[dict] = []
+        for pidx, page in enumerate(doc):
+            page_parts: list[str] = []
+            page_chars: list[dict] = []
 
-                for t in raw_tables:
-                    bbox = t.get("bbox")
-                    rows = t.get("rows") or t.get("row_count")
-                    cols = t.get("columns") or t.get("col_count")
-                    if not bbox or rows is None or cols is None:
+            table_bboxes: list[fitz.Rect] = []
+            segments: list[tuple[float, str, list]] = []
+
+            try:
+                finder = page.find_tables()
+                tables = getattr(finder, "tables", None) or []
+            except Exception:
+                tables = []
+
+            dbg_on = _pdf_extract_debug_enabled()
+            if dbg_on and tables:
+                logger.info("%s tables_detected page=%d count=%d", log_prefix, pidx + 1, len(tables))
+
+            for tab in tables:
+                try:
+                    bbox = fitz.Rect(getattr(tab, "bbox"))
+                except Exception:
+                    continue
+                table_bboxes.append(bbox)
+                seg_text, seg_chars, next_line = _table_to_text_and_chars(page, tab, line_id_start=global_line_id)
+                global_line_id = next_line
+                y0 = float(bbox.y0)
+                if seg_text.strip():
+                    if dbg_on:
+                        snip = seg_text[:400]
+                        logger.info("%s table_text_snip page=%d:\n%s", log_prefix, pidx + 1, _vis_ws(snip))
+                    segments.append((y0, seg_text, seg_chars))
+
+            words_all = page.get_text("words") or []
+            words_nt = []
+            if table_bboxes:
+                for w in words_all:
+                    try:
+                        x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+                    except Exception:
                         continue
-                    tables.append(
-                        {
-                            "bbox": list(bbox),
-                            "row_count": int(rows),
-                            "col_count": int(cols),
-                        }
-                    )
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    inside = False
+                    for tb in table_bboxes:
+                        if tb.contains(fitz.Point(cx, cy)):
+                            inside = True
+                            break
+                    if not inside:
+                        words_nt.append(w)
+            else:
+                words_nt = words_all
 
-                pages.append({"page": page_no, "markdown": md, "tables": tables})
+            nt_lines = _group_words_to_lines(words_nt, y_tol=2.0)
+            nt_text, nt_chars, next_line = _words_lines_to_text_and_chars(
+                nt_lines,
+                join_lines_with_space=False,
+                gap_x_tol=1.5,
+                line_id_start=global_line_id,
+            )
+            global_line_id = next_line
+            if nt_text.strip():
+                first_y0 = 0.0
+                if words_nt:
+                    try:
+                        first_y0 = float(sorted(words_nt, key=lambda w: (w[1], w[0]))[0][1])
+                    except Exception:
+                        first_y0 = 0.0
+                segments.append((first_y0, nt_text, nt_chars))
 
-            full_md = "\n\n".join(p["markdown"] for p in pages if p["markdown"])
-            return {"markdown": full_md, "pages": pages}
+            segments.sort(key=lambda t: t[0])
 
-        md = pymupdf4llm.to_markdown(doc=doc).replace("<br>", "\n")
-        return {"markdown": md, "pages": []}
+            for _si, (_y0, seg_text, seg_chars) in enumerate(segments):
+                if not seg_text:
+                    continue
+                if page_parts:
+                    _append_token(page_chars, page_parts, "\n\n", None, global_line_id)
+                    global_line_id += 2
+                page_parts.append(seg_text)
+                page_chars.extend(seg_chars)
+
+            page_text = "".join(page_parts).strip()
+
+            if page_text:
+                start = offset
+                full_parts.append(page_text)
+                for ch in page_chars:
+                    full_chars.append({"page": pidx, **ch})
+                offset += len(page_text)
+
+                pages_out.append({"page": pidx + 1, "text": page_text, "start": start, "end": offset})
+
+                full_parts.append("\n\n")
+                full_chars.extend([{"page": pidx, "bbox": None, "line_id": global_line_id} for _ in "\n\n"])
+                offset += 2
+                global_line_id += 2
+
+        full_text = "".join(full_parts).rstrip()
+        if len(full_chars) > len(full_text):
+            full_chars = full_chars[: len(full_text)]
+
+        return {"full_text": full_text, "pages": pages_out, "char_index": full_chars}
     finally:
         doc.close()
 
 
-def _normalize_pattern_names(patterns: List[PatternItem] | None) -> Optional[Set[str]]:
-    # 입력 패턴 목록에서 허용 rule name set 생성
+def _boxes_from_index_span(index: dict, start: int, end: int) -> List[Box]:
+    chars = index.get("char_index") or []
+    if not chars:
+        return []
+
+    s = max(0, int(start))
+    e = min(len(chars), int(end))
+    if e <= s:
+        return []
+
+    uniq: dict[tuple, int] = {}
+    for i in range(s, e):
+        ch = chars[i]
+        bbox = ch.get("bbox")
+        page = ch.get("page")
+        if bbox is None or page is None:
+            continue
+        key = (int(page), float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        uniq[key] = 1
+
+    out: List[Box] = []
+    for (p, x0, y0, x1, y1) in uniq.keys():
+        out.append(Box(page=p, x0=x0, y0=y0, x1=x1, y1=y1))
+    return out
+
+
+# (/text/markdown)
+def extract_markdown(pdf_bytes: bytes, by_page: bool = True) -> dict:
+    if pymupdf4llm is None:
+        return {"ok": False, "markdown": "", "pages": []}
+
+    # 1) in-memory doc 방식
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if by_page:
+                chunks = pymupdf4llm.to_markdown(doc, tables=True, page_chunks=True, show_progress=False)
+                pages = []
+                full_md = []
+                for i, chunk in enumerate(chunks):
+                    if isinstance(chunk, dict):
+                        md_text = chunk.get("markdown") or chunk.get("text") or ""
+                    else:
+                        md_text = str(chunk)
+                    pages.append({"page": i + 1, "markdown": md_text})
+                    full_md.append(md_text)
+                return {"ok": True, "markdown": "\n\n".join(full_md), "pages": pages}
+            md = pymupdf4llm.to_markdown(doc, tables=True, show_progress=False)
+            return {"ok": True, "markdown": str(md), "pages": []}
+        finally:
+            doc.close()
+    except Exception as e:
+        logger.error("%s PDF to Markdown error(in-memory): %s", log_prefix, e)
+
+    # 2) fallback: 임시 파일 방식
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_name = f.name
+
+        try:
+            chunks = pymupdf4llm.to_markdown(tmp_name, tables=True, page_chunks=True, show_progress=False)
+            pages = []
+            full_md = []
+            for i, chunk in enumerate(chunks):
+                if isinstance(chunk, dict):
+                    md_text = chunk.get("markdown") or chunk.get("text") or ""
+                else:
+                    md_text = str(chunk)
+                pages.append({"page": i + 1, "markdown": md_text})
+                full_md.append(md_text)
+            return {"ok": True, "markdown": "\n\n".join(full_md), "pages": pages}
+        finally:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+    except Exception as e:
+        return {"ok": False, "markdown": "", "pages": [], "error": str(e)}
+
+
+def _normalize_pattern_names(patterns: Optional[List[PatternItem]]) -> Optional[Set[str]]:
     if not patterns:
         return None
     names: Set[str] = set()
     for p in patterns:
         nm = getattr(p, "name", None) or getattr(p, "rule", None)
         if nm:
-            names.add(nm)
+            names.add(str(nm).lower())
     return names or None
 
 
-def _is_valid_value(need_valid: bool, validator, value: str) -> bool:
-    # validator(있으면)로 값 검증
-    if not need_valid or not callable(validator):
-        return True
-    try:
-        try:
-            return bool(validator(value))
-        except TypeError:
-            return bool(validator(value, None))
-    except Exception:
-        print(f"{log_prefix} VALIDATOR ERROR", repr(value))
-        return False
+def _search_with_whitespace_fallback(page: fitz.Page, needle: str) -> List[fitz.Rect]:
+    rects = page.search_for(needle) or []
+    if rects:
+        return rects
+
+    n2 = _compact_ws(needle)
+    if n2 and n2 != needle:
+        rects = page.search_for(n2) or []
+        if rects:
+            return rects
+
+    n3 = needle.replace("\n", " ").replace("\r", " ")
+    n3 = _compact_ws(n3)
+    if n3 and n3 not in (needle, n2):
+        rects = page.search_for(n3) or []
+        if rects:
+            return rects
+
+    return []
 
 
-def detect_boxes_from_patterns(pdf_bytes: bytes, patterns: List[PatternItem] | None) -> List[Box]:
-    # 텍스트 레이어에서 정규식 매치 → search_for로 좌표(box) 생성
-    from server.modules.common import compile_rules  # lazy import
-
-    comp = compile_rules()
-    allowed_names = _normalize_pattern_names(patterns)
-
-    print(
-        f"{log_prefix} detect_boxes_from_patterns: rules 준비 완료",
-        "allowed_names=",
-        sorted(allowed_names) if allowed_names else "ALL",
-    )
-
-    stats_ok: Dict[str, int] = {}
-    stats_fail: Dict[str, int] = {}
-
+def detect_boxes_from_patterns(pdf_bytes: bytes, patterns: Optional[List[PatternItem]] = None) -> List[Box]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     boxes: List[Box] = []
+    allowed = _normalize_pattern_names(patterns)
 
     try:
-        for pno, page in enumerate(doc):
-            text = page.get_text("text") or ""
-            if not text:
-                continue
+        for pidx, page in enumerate(doc):
+            text = cleanup_text(page.get_text("text") or "")
+            found = match_text(text)  # {'items': [...], 'counts': {...}}
 
-            for (rule_name, rx, need_valid, _prio, validator) in comp:
-                if allowed_names and rule_name not in allowed_names:
+            items = found.get("items", []) or []
+            for it in items:
+                if it.get("valid") is False:
                     continue
 
-                try:
-                    it = rx.finditer(text)
-                except Exception:
+                rule = (it.get("rule") or it.get("name") or "").lower()
+                if allowed is not None and rule not in allowed:
                     continue
 
-                for m in it:
-                    val = m.group(0)
-                    if not val:
-                        continue
+                val = _compact_ws(str(it.get("value") or ""))
+                if not val:
+                    continue
 
-                    ok = _is_valid_value(need_valid, validator, val)
-
-                    if ok:
-                        stats_ok[rule_name] = stats_ok.get(rule_name, 0) + 1
-                    else:
-                        stats_fail[rule_name] = stats_fail.get(rule_name, 0) + 1
-
-                    print(
-                        f"{log_prefix} MATCH",
-                        "page=",
-                        pno + 1,
-                        "rule=",
-                        rule_name,
-                        "need_valid=",
-                        need_valid,
-                        "ok=",
-                        ok,
-                        "value=",
-                        repr(val),
-                    )
-
-                    if not ok:
-                        continue
-
-                    rects = page.search_for(val)
-                    for r in rects:
-                        print(
-                            f"{log_prefix} BOX",
-                            "page=",
-                            pno + 1,
-                            "rule=",
-                            rule_name,
-                            "rect=",
-                            (r.x0, r.y0, r.x1, r.y1),
-                        )
-                        boxes.append(Box(page=pno, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1))
+                rects = _search_with_whitespace_fallback(page, val)
+                for r in rects:
+                    boxes.append(Box(page=pidx, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1))
     finally:
         doc.close()
 
-    print(
-        f"{log_prefix} detect summary",
-        "OK=",
-        {k: v for k, v in sorted(stats_ok.items())},
-        "FAIL=",
-        {k: v for k, v in sorted(stats_fail.items())},
-        "boxes=",
-        len(boxes),
-    )
-
     return boxes
 
-
-def _page_to_pil(page: fitz.Page, dpi: int = 120) -> Image.Image:
-    # PDF 페이지를 raster 이미지(PIL)로 렌더링 (OCR용)
+# OCR -> Boxes (optional)
+def _page_to_pil(page: fitz.Page, dpi: int = 120):
+    if Image is None:
+        return None
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-
-def _group_rows_by_y(blocks: List[Dict[str, Any]], row_tol: float = 35.0) -> List[List[Dict[str, Any]]]:
-    # OCR 블록을 y-center 기준으로 행(row) 클러스터링
-    if not blocks:
-        return []
-
-    enriched: List[Dict[str, Any]] = []
-    for b in blocks:
-        x0, y0, x1, y1 = b.get("bbox", [0, 0, 0, 0])
-        cy = 0.5 * (float(y0) + float(y1))
-        bb = dict(b)
-        bb["_cy"] = cy
-        enriched.append(bb)
-
-    enriched.sort(key=lambda b: b["_cy"])
-
-    rows: List[List[Dict[str, Any]]] = []
-    current: List[Dict[str, Any]] = []
-    last_cy: Optional[float] = None
-
-    for b in enriched:
-        cy = b["_cy"]
-        if last_cy is None or abs(cy - last_cy) <= row_tol:
-            current.append(b)
-        else:
-            rows.append(current)
-            current = [b]
-        last_cy = cy
-
-    if current:
-        rows.append(current)
-
-    for row in rows:
-        for b in row:
-            b.pop("_cy", None)
-
-    for row in rows:
-        row.sort(key=lambda b: float((b.get("bbox") or [0, 0, 0, 0])[0]))
-
-    return rows
-
-
-def _text_for_post(b: Dict[str, Any]) -> str:
-    # LLM 후처리 결과(normalized) 우선 사용
-    return str(b.get("normalized") or b.get("text") or "").strip()
-
-
-def _count_digits(s: str) -> int:
-    return sum(ch.isdigit() for ch in s)
-
-
-def _looks_value_like(s: str) -> bool:
-    # 라벨이 아닌 "값"처럼 보이는 토큰을 판별(라벨 전체 마스킹 방지용)
-    if not s:
-        return False
-    if "@" in s:
-        return True
-    d = _count_digits(s)
-    if d >= 2:
-        return True
-    if "-" in s or "." in s:
-        return d >= 1
-    if 2 <= len(s) <= 4 and s.isalpha():
-        return True
-    return False
-
-
-def _is_incomplete_sensitive(kind: str, text: str) -> bool:
-    # 끊긴 값(멀티라인) 후보 판별(card/email만)
-    t = text.strip()
-    if not t:
-        return False
-
-    if kind == "card":
-        digits = _count_digits(t)
-        return 10 <= digits <= 15
-    if kind == "email":
-        if "@" not in t:
-            return False
-        return t.endswith(".") or (re.search(r"\.[A-Za-z]{2,4}$", t) is None)
-    return False
-
-
-def _promote_value_like_in_rows(blocks: List[Dict[str, Any]]) -> None:
-    # 같은 행에서 "값처럼 보이는 토큰"만 민감값으로 승격
-    SENSITIVE = {"card", "phone", "email", "id"}
-
-    rows = _group_rows_by_y(blocks, row_tol=35.0)
-    for row in rows:
-        sens = [b for b in row if (b.get("kind") in SENSITIVE)]
-        if not sens:
-            continue
-
-        sens_min_x0 = min(float((b.get("bbox") or [0, 0, 0, 0])[0]) for b in sens)
-
-        for b in row:
-            if (b.get("kind") in (None, "", "none")):
-                t = _text_for_post(b)
-                if not _looks_value_like(t):
-                    continue
-
-                x0 = float((b.get("bbox") or [0, 0, 0, 0])[0])
-                if x0 + 3.0 < sens_min_x0:
-                    continue
-
-                b["kind"] = sens[0].get("kind") or "row_sensitive"
-
-
-def _promote_multiline_continuations(blocks: List[Dict[str, Any]]) -> None:
-    # 끊긴 값(다음 줄 파편)을 같은 kind로 전파
-    rows = _group_rows_by_y(blocks, row_tol=35.0)
-    if len(rows) < 2:
-        return
-
-    def x_overlap_ratio(a: List[float], b: List[float]) -> float:
-        ax0, _, ax1, _ = a
-        bx0, _, bx1, _ = b
-        inter = max(0.0, min(ax1, bx1) - max(ax0, bx0))
-        denom = max(1.0, min(ax1 - ax0, bx1 - bx0))
-        return inter / denom
-
-    for i in range(len(rows) - 1):
-        cur = rows[i]
-        nxt = rows[i + 1]
-
-        for a in cur:
-            kind = a.get("kind") or "none"
-            if kind not in ("card", "email"):
-                continue
-
-            at = _text_for_post(a)
-            if not _is_incomplete_sensitive(kind, at):
-                continue
-
-            ab = list(map(float, (a.get("bbox") or [0, 0, 0, 0])))
-            ax0, ay0, ax1, ay1 = ab
-            acx = 0.5 * (ax0 + ax1)
-
-            best = None
-            best_score = 0.0
-
-            for b in nxt:
-                if (b.get("kind") or "none") != "none":
-                    continue
-
-                bt = _text_for_post(b)
-                if not bt:
-                    continue
-
-                bb = list(map(float, (b.get("bbox") or [0, 0, 0, 0])))
-                bx0, by0, bx1, by1 = bb
-                bcx = 0.5 * (bx0 + bx1)
-
-                if by0 - ay1 > 40.0:
-                    continue
-
-                ov = x_overlap_ratio(ab, bb)
-                if ov < 0.25 and abs(bcx - acx) > 80.0:
-                    continue
-
-                if kind == "card":
-                    if not bt.replace("-", "").replace(" ", "").isdigit():
-                        continue
-                    if _count_digits(bt) > 6:
-                        continue
-                else:
-                    if not (2 <= len(bt) <= 6 and bt.isalpha()):
-                        continue
-
-                score = ov - (abs(bcx - acx) / 1000.0)
-                if score > best_score:
-                    best_score = score
-                    best = b
-
-            if best is not None:
-                best["kind"] = kind
 
 
 def detect_boxes_from_ocr(
@@ -419,7 +476,9 @@ def detect_boxes_from_ocr(
     use_llm: bool = True,
     min_conf: float = 0.3,
 ) -> List[Box]:
-    # 페이지 raster→OCR→(옵션)LLM kind→PDF좌표 변환→텍스트레이어 겹침 제외
+    if easyocr_blocks is None or Image is None:
+        return []
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     boxes: List[Box] = []
 
@@ -428,183 +487,129 @@ def detect_boxes_from_ocr(
 
     try:
         for pno, page in enumerate(doc):
-            words = page.get_text("words") or []
-            text_rects = [fitz.Rect(w[0], w[1], w[2], w[3]) for w in words]
-
-            def overlaps_text_layer(r: fitz.Rect) -> bool:
-                for tr in text_rects:
-                    if not r.intersects(tr):
-                        continue
-                    inter = r & tr
-                    if inter.get_area() > 0:
-                        return True
-                return False
-
             img = _page_to_pil(page, dpi=dpi)
+            if img is None:
+                continue
 
-            ocr_blocks = easyocr_blocks(img, min_conf=min_conf, gpu=False)
-            print(f"{log_prefix} OCR page={pno + 1} blocks=", len(ocr_blocks))
+            ocr_blocks = easyocr_blocks(img, min_conf=min_conf, gpu=False) or []
 
-            if use_llm and ocr_blocks:
-                ocr_blocks = classify_blocks_with_qwen(ocr_blocks)
-                _promote_value_like_in_rows(ocr_blocks)
-                _promote_multiline_continuations(ocr_blocks)
+            if use_llm and classify_blocks_with_qwen is not None and ocr_blocks:
+                try:
+                    ocr_blocks = classify_blocks_with_qwen(ocr_blocks) or ocr_blocks
+                except Exception:
+                    pass
 
             for blk in ocr_blocks:
                 kind = blk.get("kind") or "none"
                 if use_llm and kind == "none":
                     continue
 
-                x0_px, y0_px, x1_px, y1_px = blk["bbox"]
+                x0_px, y0_px, x1_px, y1_px = blk.get("bbox") or [0, 0, 0, 0]
 
                 x0 = float(x0_px) * inv_scale
                 y0 = float(y0_px) * inv_scale
                 x1 = float(x1_px) * inv_scale
                 y1 = float(y1_px) * inv_scale
 
-                width = x1 - x0
-                height = y1 - y0
-
-                if height > 1.0:
-                    pad_y = min(max(height * 0.15, 0.6), 3.0)
-                    y0 -= pad_y
-                    y1 += pad_y
-
-                if width > 1.0:
-                    pad_x_left = min(max(width * 0.01, 0.2), 1.2)
-                    pad_x_right = min(max(width * 0.06, 0.8), 6.0)
-                    x0 -= pad_x_left
-                    x1 += pad_x_right
-
                 rect_pdf = fitz.Rect(x0, y0, x1, y1) & page.rect
-                if overlaps_text_layer(rect_pdf):
-                    continue
-
-                print(
-                    f"{log_prefix} OCR BOX",
-                    "page=",
-                    pno + 1,
-                    "kind=",
-                    kind,
-                    "text=",
-                    repr(_text_for_post(blk)),
-                    "bbox_px=",
-                    (x0_px, y0_px, x1_px, y1_px),
-                    "bbox_pdf=",
-                    (rect_pdf.x0, rect_pdf.y0, rect_pdf.x1, rect_pdf.y1),
-                )
-
-                boxes.append(
-                    Box(
-                        page=pno,
-                        x0=rect_pdf.x0,
-                        y0=rect_pdf.y0,
-                        x1=rect_pdf.x1,
-                        y1=rect_pdf.y1,
-                    )
-                )
+                boxes.append(Box(page=pno, x0=rect_pdf.x0, y0=rect_pdf.y0, x1=rect_pdf.x1, y1=rect_pdf.y1))
     finally:
         doc.close()
 
-    print(f"{log_prefix} detect_boxes_from_ocr summary", "boxes=", len(boxes))
     return boxes
 
 
+
 def _fill_color(fill: str):
-    # PyMuPDF fill 색상(0~1 float) 변환
     f = (fill or "black").strip().lower()
-    return (0, 0, 0) if f == "black" else (1, 1, 1)
+    if f == "white":
+        return (1, 1, 1)
+    return (0, 0, 0)
 
 
 def apply_redaction(pdf_bytes: bytes, boxes: List[Box], fill: str = "black") -> bytes:
-    # Box 리스트를 실제 redact annotation으로 적용 후 저장
-    print(f"{log_prefix} apply_redaction: boxes=", len(boxes), "fill=", fill)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        color = _fill_color(fill)
+        touched: set[int] = set()
+        fcol = _fill_color(fill)
+
         for b in boxes:
-            page = doc.load_page(int(b.page))
-            rect = fitz.Rect(float(b.x0), float(b.y0), float(b.x1), float(b.y1))
-            page.add_redact_annot(rect, fill=color)
+            if b.page < 0 or b.page >= len(doc):
+                continue
+            page = doc[b.page]
+            rect = fitz.Rect(b.x0, b.y0, b.x1, b.y1)
+            page.add_redact_annot(rect, fill=fcol)
+            touched.add(int(b.page))
 
-        for page in doc:
-            page.apply_redactions()
+        for pno in sorted(touched):
+            doc[pno].apply_redactions()
 
-        out = io.BytesIO()
-        doc.save(out)
-        return out.getvalue()
+        return doc.tobytes()
     finally:
         doc.close()
 
 
-def apply_text_redaction(pdf_bytes: bytes, extra_spans: List[dict] | None = None) -> bytes:
-    # 패턴 탐지 + OCR 탐지 + (옵션) NER span을 박스로 변환 후 일괄 레닥션
+def apply_text_redaction(
+    pdf_bytes: bytes,
+    extra_spans: Optional[List[dict]] = None,
+    *,
+    fill: str = "black",
+    use_ocr: bool = False,
+    use_llm: bool = True,
+    dpi: int = 120,
+    min_conf: float = 0.3,
+) -> bytes:
     patterns = [PatternItem(**p) for p in PRESET_PATTERNS]
     boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
 
-    ocr_boxes = detect_boxes_from_ocr(pdf_bytes, dpi=120, use_llm=True, min_conf=0.3)
+    if use_ocr:
+        boxes.extend(detect_boxes_from_ocr(pdf_bytes, dpi=dpi, use_llm=use_llm, min_conf=min_conf))
 
-    print(
-        f"{log_prefix} apply_text_redaction: pattern_boxes=",
-        len(boxes),
-        "ocr_boxes=",
-        len(ocr_boxes),
-    )
-
-    boxes.extend(ocr_boxes)
-
+    # NER span(start/end) 기반이면 indexed로 box 변환(가장 안정적)
     if extra_spans:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
-            page_texts: List[str] = []
-            page_offsets: List[int] = []
-            current_offset = 0
+            index = extract_text_indexed(pdf_bytes)
+        except Exception:
+            index = None
 
-            for page in doc:
-                text = page.get_text("text") or ""
-                page_texts.append(text)
-                page_offsets.append(current_offset)
-                current_offset += len(text) + 1
-
-            full_text = "\n".join(page_texts)
-
-            for span in extra_spans:
-                start = span.get("start", 0)
-                end = span.get("end", 0)
-                if end <= start or start >= len(full_text):
+        if index and index.get("char_index"):
+            for sp in extra_spans:
+                try:
+                    s_i = int(sp.get("start"))
+                    e_i = int(sp.get("end"))
+                except Exception:
                     continue
-
-                span_text = full_text[start: min(end, len(full_text))]
-                if not span_text or not span_text.strip():
+                if e_i <= s_i:
                     continue
+                boxes.extend(_boxes_from_index_span(index, s_i, e_i))
 
-                search_text = span_text.strip()
-                if not search_text:
-                    continue
+    return apply_redaction(pdf_bytes, boxes, fill=fill)
 
-                for page_idx, page_offset in enumerate(page_offsets):
-                    next_offset = page_offsets[page_idx + 1] if page_idx + 1 < len(page_offsets) else len(full_text)
-                    if start >= page_offset and start < next_offset:
-                        page = doc[page_idx]
-                        rects = page.search_for(search_text)
 
-                        if rects:
-                            for r in rects:
-                                boxes.append(Box(page=page_idx, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1))
-
-                            print(
-                                f"{log_prefix} NER BOX",
-                                "page=",
-                                page_idx + 1,
-                                "label=",
-                                span.get("label", "unknown"),
-                                "text=",
-                                repr(search_text[:50]),
-                                "matches=",
-                                len(rects),
-                            )
-                        break
-        finally:
-            doc.close()
-
-    return apply_redaction(pdf_bytes, boxes)
+# Table layout (/redactions/tables)
+def extract_table_layout(pdf_bytes: bytes) -> dict:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        out = []
+        for pidx, page in enumerate(doc):
+            try:
+                finder = page.find_tables()
+                tables = getattr(finder, "tables", None) or []
+            except Exception:
+                tables = []
+            for t in tables:
+                try:
+                    bbox = list(getattr(t, "bbox"))
+                except Exception:
+                    bbox = None
+                out.append(
+                    {
+                        "page": pidx + 1,
+                        "bbox": bbox,
+                        "row_count": getattr(t, "row_count", None),
+                        "col_count": getattr(t, "col_count", None),
+                    }
+                )
+        return {"tables": out}
+    finally:
+        doc.close()

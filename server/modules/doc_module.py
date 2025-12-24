@@ -561,38 +561,193 @@ def replace_text(file_bytes: bytes, targets: List[Tuple[int, int, str]], replace
         return file_bytes
 
 
-def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as tmp:
-            tmp.write(original_file_bytes)
-            tmp_path = tmp.name
+_OLE_MAGIC = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+_FREESECT = 0xFFFFFFFF
+_ENDOFCHAIN = 0xFFFFFFFE
+_FATSECT = 0xFFFFFFFD
+_DIFSECT = 0xFFFFFFFC
 
-        with olefile.OleFileIO(tmp_path, write_mode=True) as ole:
-            if not ole.exists("WordDocument"):
-                return original_file_bytes
-            old_len = len(ole.openstream("WordDocument").read())
-            if len(new_word_data) != old_len:
-                return original_file_bytes
-            ole.write_stream("WordDocument", new_word_data)
 
-        with open(tmp_path, "rb") as f:
-            result = f.read()
-        return result
+def _u16(buf: bytes, off: int) -> int:
+    return struct.unpack_from("<H", buf, off)[0]
 
-    except Exception as e:
-        print(f"[ERR] OLE 교체 중 오류: {e}")
+
+def _u32(buf: bytes, off: int) -> int:
+    return struct.unpack_from("<I", buf, off)[0]
+
+
+def _u64(buf: bytes, off: int) -> int:
+    return struct.unpack_from("<Q", buf, off)[0]
+
+
+def _sect_off(sector: int, sector_size: int) -> int:
+    # OLE: sector 0 starts right after 512-byte header
+    return (sector + 1) * sector_size
+
+
+def _read_sector(data: bytes, sector: int, sector_size: int) -> bytes:
+    off = _sect_off(sector, sector_size)
+    end = off + sector_size
+    if off < 0 or end > len(data):
+        return b""
+    return data[off:end]
+
+
+def _iter_fat_chain(start_sector: int, fat: List[int], *, max_steps: int = 2_000_000):
+    # generator of sectors in the chain
+    seen = set()
+    s = int(start_sector)
+    steps = 0
+    while s not in (_ENDOFCHAIN, _FREESECT) and s >= 0 and s < len(fat):
+        if s in seen:
+            break  # loop guard
+        seen.add(s)
+        yield s
+        s = int(fat[s])
+        steps += 1
+        if steps >= max_steps:
+            break
+
+
+def _collect_fat_sectors(data: bytes, sector_size: int) -> List[int]:
+    # DIFAT header entries: 109 * 4 bytes starting at 0x4C
+    fat_sectors: List[int] = []
+    for i in range(109):
+        v = _u32(data, 0x4C + i * 4)
+        if v in (_FREESECT, _ENDOFCHAIN):
+            continue
+        fat_sectors.append(int(v))
+
+    difat_start = _u32(data, 0x44)
+    num_difat = _u32(data, 0x48)
+
+    if difat_start in (_FREESECT, _ENDOFCHAIN) or num_difat == 0:
+        return fat_sectors
+
+    # DIFAT sector contains (sector_size/4 - 1) FAT sector indices + last = next DIFAT sector
+    next_difat = int(difat_start)
+    visited = set()
+    for _ in range(int(num_difat) + 1):
+        if next_difat in visited or next_difat in (_FREESECT, _ENDOFCHAIN):
+            break
+        visited.add(next_difat)
+        sec = _read_sector(data, next_difat, sector_size)
+        if not sec:
+            break
+        count = sector_size // 4
+        for j in range(count - 1):
+            v = struct.unpack_from("<I", sec, j * 4)[0]
+            if v in (_FREESECT, _ENDOFCHAIN):
+                continue
+            fat_sectors.append(int(v))
+        next_difat = struct.unpack_from("<I", sec, (count - 1) * 4)[0]
+    return fat_sectors
+
+
+def _build_fat(data: bytes, sector_size: int) -> List[int]:
+    fat_sectors = _collect_fat_sectors(data, sector_size)
+    out: List[int] = []
+    for fs in fat_sectors:
+        sec = _read_sector(data, fs, sector_size)
+        if not sec:
+            continue
+        for i in range(sector_size // 4):
+            out.append(struct.unpack_from("<I", sec, i * 4)[0])
+    return out
+
+
+def _read_stream_from_chain(data: bytes, sector_size: int, fat: List[int], start_sector: int, size: Optional[int] = None) -> bytes:
+    chunks: List[bytes] = []
+    for s in _iter_fat_chain(start_sector, fat):
+        chunks.append(_read_sector(data, s, sector_size))
+    raw = b"".join(chunks)
+    if size is not None and size >= 0:
+        return raw[: int(size)]
+    return raw
+
+
+def _find_dir_entry(data: bytes, sector_size: int, fat: List[int], name: str) -> Optional[Tuple[int, int]]:
+    # returns (start_sector, size) for a stream
+    dir_start = _u32(data, 0x30)
+    if dir_start in (_FREESECT, _ENDOFCHAIN):
+        return None
+
+    dir_raw = _read_stream_from_chain(data, sector_size, fat, int(dir_start), None)
+    if not dir_raw:
+        return None
+
+    target = name.strip()
+    for off in range(0, len(dir_raw) - 128 + 1, 128):
+        ent = dir_raw[off : off + 128]
+        try:
+            name_len = _u16(ent, 64)
+            if name_len < 2 or name_len > 64:
+                continue
+            nm = ent[: name_len - 2].decode("utf-16le", errors="ignore").rstrip("\x00")
+            if nm != target:
+                continue
+            # stream start sector + size
+            start_sector = _u32(ent, 116)
+            size = _u64(ent, 120)
+            return int(start_sector), int(size)
+        except Exception:
+            continue
+    return None
+
+
+def _overwrite_stream_in_ole(original_file_bytes: bytes, stream_name: str, new_stream_bytes: bytes) -> bytes:
+    data = bytes(original_file_bytes)
+    if len(data) < 512 or data[:8] != _OLE_MAGIC:
         return original_file_bytes
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+    sector_shift = _u16(data, 0x1E)
+    sector_size = 1 << int(sector_shift)
+    if sector_size not in (512, 1024, 2048, 4096):
+        return original_file_bytes
+
+    fat = _build_fat(data, sector_size)
+    if not fat:
+        return original_file_bytes
+
+    entry = _find_dir_entry(data, sector_size, fat, stream_name)
+    if not entry:
+        return original_file_bytes
+    start_sector, stream_size = entry
+
+    if int(stream_size) != len(new_stream_bytes):
+        return original_file_bytes
+
+    # in-place overwrite: only write stream_size bytes, keep the rest of last sector untouched
+    out = bytearray(data)
+    pos = 0
+    for s in _iter_fat_chain(start_sector, fat):
+        if pos >= stream_size:
+            break
+        off = _sect_off(s, sector_size)
+        take = min(sector_size, stream_size - pos)
+        if off < 0 or off + take > len(out):
+            return original_file_bytes
+        out[off : off + take] = new_stream_bytes[pos : pos + take]
+        pos += take
+
+    if pos != stream_size:
+        # chain shorter than expected
+        return original_file_bytes
+
+    return bytes(out)
 
 
-def redact_word_document(file_bytes: bytes) -> bytes:
+def create_new_ole_file(original_file_bytes: bytes, new_word_data: bytes) -> bytes:
+
+    try:
+        return _overwrite_stream_in_ole(original_file_bytes, "WordDocument", new_word_data)
+    except Exception as e:
+        print(f"[ERR] OLE overwrite 중 오류: {e}")
+        return original_file_bytes
+
+
+
+def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
     try:
         data = extract_text(file_bytes)
         raw_text = data.get("raw_text", "")
@@ -603,14 +758,58 @@ def redact_word_document(file_bytes: bytes) -> bytes:
         matches = find_sensitive_spans(norm_text)
         matches = split_matches(matches, norm_text)
 
+        span_ranges: List[Tuple[int, int]] = []
+        if spans and isinstance(spans, list):
+            n = len(norm_text)
+            for sp in spans:
+                if not isinstance(sp, dict):
+                    continue
+                s = sp.get("start")
+                e = sp.get("end")
+                if s is None or e is None:
+                    continue
+                try:
+                    s = int(s)
+                    e = int(e)
+                except Exception:
+                    continue
+                s = max(0, min(n, s))
+                e = max(0, min(n, e))
+                if e <= s:
+                    continue
+                span_ranges.append((s, e))
+        if span_ranges:
+            # find_sensitive_spans와 동일 포맷으로 합치기(값은 참고용)
+            for s, e in span_ranges:
+                matches.append((s, e, norm_text[s:e], "SPAN"))
+
         targets = []
+        def _map_pos(idx: int) -> Optional[int]:
+            if idx in index_map:
+                return index_map[idx]
+            j = idx
+            while j >= 0 and j not in index_map:
+                j -= 1
+            if j >= 0 and j in index_map:
+                return index_map[j]
+            j = idx
+            while j < len(norm_text) and j not in index_map:
+                j += 1
+            if j < len(norm_text) and j in index_map:
+                return index_map[j]
+            return None
+
         for s, e, val, _ in matches:
-            if s in index_map and (e - 1) in index_map:
-                start = index_map[s]
-                end = index_map.get(e - 1, start) + 1
-                if end <= start:
-                    end = start + (e - s)
-                targets.append((start, end, val))
+            if not isinstance(s, int) or not isinstance(e, int) or e <= s:
+                continue
+            start = _map_pos(s)
+            end0 = _map_pos(e - 1)
+            if start is None or end0 is None:
+                continue
+            end = end0 + 1
+            if end <= start:
+                end = start + max(1, (e - s))
+            targets.append((start, end, val))
         return replace_text(file_bytes, targets)
 
     except Exception as e:
@@ -618,7 +817,7 @@ def redact_word_document(file_bytes: bytes) -> bytes:
         return file_bytes
 
 
-def redact(file_bytes: bytes) -> bytes:
-    redacted_doc = redact_word_document(file_bytes)
+def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> bytes:
+    redacted_doc = redact_word_document(file_bytes, spans=spans)
     redacted_doc = redact_workbooks(redacted_doc)
     return redacted_doc

@@ -15,6 +15,8 @@ try:
         sub_text_nodes,
         chart_sanitize,
         redact_embedded_xlsx_bytes,
+        HWPX_STRIP_PREVIEW,
+        HWPX_BLANK_PREVIEW,
         HWPX_DISABLE_CACHE,
     )
 except Exception:
@@ -24,6 +26,8 @@ except Exception:
         sub_text_nodes,
         chart_sanitize,
         redact_embedded_xlsx_bytes,
+        HWPX_STRIP_PREVIEW,
+        HWPX_BLANK_PREVIEW,
         HWPX_DISABLE_CACHE,
     )
 
@@ -75,7 +79,6 @@ def _env_float(key: str, default: float) -> float:
 
 
 def _ensure_ocr_env_compat(env_prefix: str):
-    # 기존 HWPX_OCR_MIN_CONF(언더스코어) -> ocr_image_redactor에서 쓰는 HWPX_OCR_MINCONF(붙여쓰기)로 브릿지
     mapping = [
         ("OCR_MINCONF", "OCR_MIN_CONF"),
         ("OCR_MINCONF2", "OCR_MIN_CONF2"),
@@ -374,9 +377,19 @@ def redact_item(filename: str, data: bytes, comp) -> Optional[bytes]:
     log.info("[HWPX][RED] entry=%s size=%d", filename, len(data))
 
     if low.startswith("preview/"):
+        # preview 삭제는 일부 뷰어/검증에서 파일 손상으로 판단될 수 있어 기본은 유지
         if low.endswith(IMAGE_EXTS):
             log.info("[HWPX][IMG] preview image=%s size=%d", filename, len(data))
-        return b""
+            if HWPX_STRIP_PREVIEW:
+                return b""
+            if HWPX_BLANK_PREVIEW:
+                # 1x1 transparent PNG
+                return (
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+                    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0bIDATx\x9cc``\x00\x00"
+                    b"\x00\x02\x00\x01\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82"
+                )
+        return b"" if HWPX_STRIP_PREVIEW else data
 
     if HWPX_DISABLE_CACHE and low.endswith("settings.xml"):
         try:
