@@ -173,9 +173,70 @@ def _apply_spans(src: str, allowed) -> tuple[str, int]:
 
 # XML 텍스트 노드 마스킹
 _TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.DOTALL)
+_XML_DECL_ENC_RE = re.compile(br'encoding\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _detect_xml_encoding(xml_bytes: bytes) -> tuple[str, bytes]:
+    """
+    XML 바이트의 인코딩을 최대한 보수적으로 감지해서 (encoding, bom_bytes)를 반환.
+    - utf-16/utf-8 BOM을 우선
+    - (BOM 없을 때) XML 선언부 encoding=...을 ASCII 범위에서 탐색
+    """
+    if not xml_bytes:
+        return "utf-8", b""
+
+    # BOM 우선
+    if xml_bytes.startswith(b"\xEF\xBB\xBF"):
+        return "utf-8", b"\xEF\xBB\xBF"
+    if xml_bytes.startswith(b"\xFF\xFE"):
+        return "utf-16le", b"\xFF\xFE"
+    if xml_bytes.startswith(b"\xFE\xFF"):
+        return "utf-16be", b"\xFE\xFF"
+
+    # XML 선언부는 보통 ASCII라서 앞부분만 스캔
+    head = xml_bytes[:256]
+    try:
+        m = _XML_DECL_ENC_RE.search(head)
+        if m:
+            enc = (m.group(1) or b"").decode("ascii", "ignore").strip().lower()
+            if enc:
+                # python codec alias 보정
+                if enc in ("utf8",):
+                    enc = "utf-8"
+                if enc in ("utf16",):
+                    # BOM 없을 때 utf-16은 endianness 추정이 어려우니 우선 utf-8로 fallback
+                    return "utf-8", b""
+                return enc, b""
+    except Exception:
+        pass
+
+    return "utf-8", b""
+
+
+def _xml_bytes_to_text(xml_bytes: bytes) -> tuple[str, str, bytes]:
+    enc, bom = _detect_xml_encoding(xml_bytes)
+    try:
+        if bom and enc == "utf-8":
+            # utf-8-sig처럼 BOM 제거 후 디코드
+            return xml_bytes[len(bom) :].decode("utf-8", "ignore"), "utf-8", bom
+        return xml_bytes.decode(enc, "ignore"), enc, bom
+    except Exception:
+        # 최후의 fallback
+        return xml_bytes.decode("utf-8", "ignore"), "utf-8", b""
+
+
+def _xml_text_to_bytes(text: str, enc: str, bom: bytes) -> bytes:
+    try:
+        if enc in ("utf-16le", "utf-16be") and bom:
+            return bom + (text or "").encode(enc, "ignore")
+        if enc == "utf-8" and bom:
+            return bom + (text or "").encode("utf-8", "ignore")
+        return (text or "").encode(enc, "ignore")
+    except Exception:
+        return (text or "").encode("utf-8", "ignore")
 
 def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
-    s = xml_bytes.decode("utf-8", "ignore")
+    s, enc, bom = _xml_bytes_to_text(xml_bytes)
     all_allowed: List[tuple] = []
     all_forbidden: List[tuple] = []
     for m in _TEXT_NODE_RE.finditer(s):
@@ -190,16 +251,13 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
             all_forbidden.append((base + f_s, base + f_e))
     all_allowed = _filter_allowed_by_forbidden(all_allowed, all_forbidden)
     masked, hits = _apply_spans(s, all_allowed)
-    return masked.encode("utf-8", "ignore"), hits
+    return _xml_text_to_bytes(masked, enc, bom), hits
 
 def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
     if not xml_bytes or not literals:
         return xml_bytes
 
-    try:
-        s = xml_bytes.decode("utf-8", "ignore")
-    except Exception:
-        return xml_bytes
+    s, enc, bom = _xml_bytes_to_text(xml_bytes)
 
     lits = [str(x) for x in literals if isinstance(x, str) and x.strip()]
     if not lits:
@@ -233,7 +291,7 @@ def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> by
     out_s = "".join(pieces)
     if out_s == s:
         return xml_bytes
-    return out_s.encode("utf-8", "ignore")
+    return _xml_text_to_bytes(out_s, enc, bom)
 
 # 차트 라벨/값 마스킹(XML)
 def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:

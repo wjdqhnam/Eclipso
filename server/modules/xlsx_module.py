@@ -7,6 +7,7 @@ import unicodedata
 import os
 import inspect
 import logging
+import xml.etree.ElementTree as ET
 from typing import List, Tuple, Optional
 
 try:
@@ -254,10 +255,178 @@ def xlsx_text(zipf: zipfile.ZipFile) -> str:
     return "\n".join(filtered_lines)
 
 
+def _xlsx_col_to_index(col: str) -> int:
+    # A -> 0, B -> 1, Z -> 25, AA -> 26 ...
+    n = 0
+    for ch in col.upper():
+        if not ("A" <= ch <= "Z"):
+            continue
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return max(0, n - 1)
+
+
+def _xlsx_cell_ref_to_rc(ref: str) -> Tuple[int, int]:
+    # "C5" -> (row_idx=4, col_idx=2)
+    s = (ref or "").strip()
+    if not s:
+        return (0, 0)
+    col = []
+    row = []
+    for ch in s:
+        if ch.isalpha():
+            col.append(ch)
+        elif ch.isdigit():
+            row.append(ch)
+    r = int("".join(row)) - 1 if row else 0
+    c = _xlsx_col_to_index("".join(col)) if col else 0
+    return (max(0, r), max(0, c))
+
+
+def _xlsx_read_shared_strings(zipf: zipfile.ZipFile) -> List[str]:
+    try:
+        raw = zipf.read("xl/sharedStrings.xml")
+    except KeyError:
+        return []
+
+    try:
+        root = ET.fromstring(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return []
+
+    # namespace 무시하고 <si> 안의 모든 <t> 텍스트를 연결
+    out: List[str] = []
+    for si in root.findall(".//{*}si"):
+        parts: List[str] = []
+        for t in si.findall(".//{*}t"):
+            if t.text:
+                parts.append(t.text)
+        out.append(unicodedata.normalize("NFKC", "".join(parts)))
+    return out
+
+
+def _xlsx_sheet_to_grid(zipf: zipfile.ZipFile, sheet_path: str, sst: List[str]) -> List[List[str]]:
+    try:
+        raw = zipf.read(sheet_path)
+    except KeyError:
+        return []
+
+    try:
+        root = ET.fromstring(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return []
+
+    cells: dict[Tuple[int, int], str] = {}
+    max_r = -1
+    max_c = -1
+
+    for c in root.findall(".//{*}sheetData/{*}row/{*}c"):
+        ref = c.attrib.get("r") or ""
+        r, col = _xlsx_cell_ref_to_rc(ref)
+        t = (c.attrib.get("t") or "").strip()
+
+        v = ""
+        if t == "s":
+            v_el = c.find("{*}v")
+            try:
+                idx = int((v_el.text or "").strip()) if v_el is not None else -1
+            except Exception:
+                idx = -1
+            if 0 <= idx < len(sst):
+                v = sst[idx]
+        elif t == "inlineStr":
+            # <c t="inlineStr"><is><t>...</t></is></c>
+            is_el = c.find("{*}is")
+            if is_el is not None:
+                parts = []
+                for t_el in is_el.findall(".//{*}t"):
+                    if t_el.text:
+                        parts.append(t_el.text)
+                v = unicodedata.normalize("NFKC", "".join(parts))
+        else:
+            v_el = c.find("{*}v")
+            v = (v_el.text or "") if v_el is not None else ""
+            v = unicodedata.normalize("NFKC", v)
+
+        v = (v or "").strip()
+        if v != "":
+            cells[(r, col)] = v
+            if r > max_r:
+                max_r = r
+            if col > max_c:
+                max_c = col
+
+    if max_r < 0 or max_c < 0:
+        return []
+
+    grid: List[List[str]] = []
+    for r in range(max_r + 1):
+        row = []
+        for cidx in range(max_c + 1):
+            row.append(cells.get((r, cidx), ""))
+        grid.append(row)
+    return grid
+
+
+def _grid_to_tsv(grid: List[List[str]], *, max_rows: int = 200, max_cols: int = 60) -> str:
+    if not grid:
+        return ""
+    # 전체 기준으로 trailing empty col/row trim
+    max_c = -1
+    max_r = -1
+    for r, row in enumerate(grid):
+        for c, v in enumerate(row):
+            if str(v).strip():
+                max_r = max(max_r, r)
+                max_c = max(max_c, c)
+
+    if max_r < 0 or max_c < 0:
+        return ""
+
+    max_r = min(max_r, max_rows - 1)
+    max_c = min(max_c, max_cols - 1)
+
+    lines: List[str] = []
+    for r in range(max_r + 1):
+        row = grid[r]
+        cells = [str(row[c]).replace("\t", " ").strip() for c in range(max_c + 1)]
+        lines.append("\t".join(cells).rstrip())
+
+    # 너무 큰 시트는 안내 라인
+    truncated = (max_r + 1 < len(grid)) or any(len(r) > max_c + 1 for r in grid)
+    if truncated:
+        lines.append("")
+        lines.append(f"(표 일부만 표시: rows<= {max_rows}, cols<= {max_cols})")
+
+    return "\n".join(lines).strip()
+
+
+def xlsx_table_text(zipf: zipfile.ZipFile) -> str:
+    # sheet1..n을 TSV로 구성 (UI의 normalizeTsvTablesToMarkdown가 표로 렌더링)
+    sst = _xlsx_read_shared_strings(zipf)
+    sheet_names = sorted(
+        [n for n in zipf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+    )
+
+    blocks: List[str] = []
+    for sp in sheet_names:
+        grid = _xlsx_sheet_to_grid(zipf, sp, sst)
+        tsv = _grid_to_tsv(grid)
+        if not tsv.strip():
+            continue
+        # 시트 구분: 표 블록 앞에 라벨 1줄 (표 파싱과 충돌하지 않도록 탭 없는 단일 라인)
+        blocks.append(f"[{sp.split('/')[-1]}]")
+        blocks.append(tsv)
+        blocks.append("")
+
+    return "\n".join(blocks).strip()
+
+
 def extract_text(file_bytes: bytes) -> dict:
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
-        txt = xlsx_text(zipf)
-    return {"full_text": txt, "pages": [{"page": 1, "text": txt}]}
+        tsv = xlsx_table_text(zipf)
+        # fallback: 테이블 재구성이 실패하면 기존 텍스트 추출 사용
+        txt = tsv if tsv.strip() else xlsx_text(zipf)
+    return {"full_text": txt, "markdown": txt, "pages": [{"page": 1, "text": txt}]}
 
 
 def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:

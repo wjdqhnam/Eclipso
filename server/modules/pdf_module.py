@@ -7,7 +7,7 @@ import logging
 import tempfile
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import fitz  # PyMuPDF
+import fitz
 
 try:
     import pymupdf4llm  # type: ignore
@@ -23,7 +23,7 @@ try:
 except Exception:  # pragma: no cover
     from ..modules.common import cleanup_text  # type: ignore
 
-# Optional OCR deps (없으면 OCR 기능 비활성)
+# Optional OCR deps
 try:
     from server.modules.ocr_module import easyocr_blocks  # type: ignore
 except Exception:
@@ -61,9 +61,8 @@ def _compact_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ")).strip()
 
 
-# Basic text extraction (/text/extract)
+# (/text/extract)
 def extract_text(file_bytes: bytes) -> dict:
-   
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
         pages: List[dict] = []
@@ -345,7 +344,7 @@ def _boxes_from_index_span(index: dict, start: int, end: int) -> List[Box]:
     return out
 
 
-# Markdown extraction (/text/markdown)
+# (/text/markdown)
 def extract_markdown(pdf_bytes: bytes, by_page: bool = True) -> dict:
     if pymupdf4llm is None:
         return {"ok": False, "markdown": "", "pages": []}

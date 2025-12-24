@@ -16,6 +16,15 @@ LABELSST = 0x00FD
 HEADER = 0x0014
 FOOTER = 0x0015
 HEADERFOOTER = 0x089C
+BOF = 0x0809
+EOF = 0x000A
+BOUNDSHEET = 0x0085
+CODEPAGE = 0x0042
+NUMBER = 0x0203
+RK = 0x027E
+MULRK = 0x00BD
+BOOLERR = 0x0205
+FORMULA = 0x0006
 
 
 def le16(b, off=0) -> int:
@@ -35,6 +44,228 @@ def iter_biff_records(data: bytes):
         payload = data[off : off + length]
         off += length
         yield opcode, length, payload, header_off
+
+
+def iter_biff_records_from(data: bytes, start_off: int):
+    off, n = int(start_off), len(data)
+    off = max(0, min(off, n))
+    while off + 4 <= n:
+        opcode, length = struct.unpack_from("<HH", data, off)
+        header_off = off
+        off += 4
+        payload = data[off : off + length]
+        off += length
+        yield opcode, length, payload, header_off
+
+
+def _codepage_to_encoding(cp: int) -> str:
+    # 자주 나오는 코드페이지만 매핑, 나머지는 안전하게 latin1 fallback
+    if cp == 949:
+        return "cp949"
+    if cp == 1252:
+        return "cp1252"
+    if cp == 65001:
+        return "utf-8"
+    return "latin1"
+
+
+def _parse_codepage(wb: bytes) -> str:
+    try:
+        for opcode, _length, payload, _hdr in iter_biff_records(wb):
+            if opcode == CODEPAGE and len(payload) >= 2:
+                cp = le16(payload, 0)
+                return _codepage_to_encoding(int(cp))
+    except Exception:
+        pass
+    return "cp949"
+
+
+def _decode_rk(rk: int) -> float:
+    # RK value decoding (BIFF8)
+    # bit0: /100, bit1: integer
+    div100 = rk & 0x01
+    is_int = rk & 0x02
+    if is_int:
+        v = rk >> 2
+        # 30-bit signed
+        if v & (1 << 29):
+            v -= (1 << 30)
+        out = float(v)
+    else:
+        raw64 = (rk & 0xFFFFFFFC) << 34
+        out = struct.unpack("<d", struct.pack("<Q", raw64))[0]
+    if div100:
+        out = out / 100.0
+    return out
+
+
+def _fmt_num(x: float) -> str:
+    try:
+        if abs(x - int(x)) < 1e-9:
+            return str(int(x))
+    except Exception:
+        pass
+    # 과도한 소수 자릿수 방지
+    s = f"{x:.10g}"
+    return s
+
+
+def _parse_boundsheets(wb: bytes, enc: str) -> List[Tuple[str, int]]:
+    sheets: List[Tuple[str, int]] = []
+    in_globals = False
+    try:
+        for opcode, _length, payload, _hdr in iter_biff_records(wb):
+            if opcode == BOF and len(payload) >= 4:
+                # payload: version(2) + type(2)
+                sub_type = le16(payload, 2)
+                in_globals = (sub_type == 0x0005)
+                continue
+
+            if in_globals and opcode == BOUNDSHEET and len(payload) >= 8:
+                off = le32(payload, 0)
+                name_len = payload[6]
+                opt = payload[7]
+                is_unicode = bool(opt & 0x01)
+                name_bytes = payload[8:]
+                if is_unicode:
+                    raw = name_bytes[: name_len * 2]
+                    name = raw.decode("utf-16le", errors="ignore")
+                else:
+                    raw = name_bytes[: name_len]
+                    try:
+                        name = raw.decode(enc, errors="ignore")
+                    except Exception:
+                        name = raw.decode("latin1", errors="ignore")
+                name = (name or "").strip() or f"Sheet{len(sheets) + 1}"
+                sheets.append((name, int(off)))
+                continue
+
+            if in_globals and opcode == EOF:
+                break
+    except Exception:
+        return sheets
+
+    return sheets
+
+
+def _sheet_cells_to_tsv(wb: bytes, sheet_off: int, strings: List[str], *, max_rows: int = 200, max_cols: int = 60) -> str:
+    cells: Dict[Tuple[int, int], str] = {}
+    max_r = -1
+    max_c = -1
+
+    for opcode, _length, payload, _hdr in iter_biff_records_from(wb, sheet_off):
+        if opcode == EOF:
+            break
+
+        try:
+            if opcode == LABELSST and len(payload) >= 10:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                idx = le32(payload, 6)
+                v = strings[idx] if 0 <= idx < len(strings) else ""
+                v = (v or "").strip()
+                if v:
+                    cells[(r, c)] = v
+                    max_r = max(max_r, r)
+                    max_c = max(max_c, c)
+
+            elif opcode == NUMBER and len(payload) >= 14:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                num = struct.unpack("<d", payload[6:14])[0]
+                v = _fmt_num(float(num))
+                if v:
+                    cells[(r, c)] = v
+                    max_r = max(max_r, r)
+                    max_c = max(max_c, c)
+
+            elif opcode == RK and len(payload) >= 10:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                rk = le32(payload, 6)
+                v = _fmt_num(_decode_rk(int(rk)))
+                if v:
+                    cells[(r, c)] = v
+                    max_r = max(max_r, r)
+                    max_c = max(max_c, c)
+
+            elif opcode == MULRK and len(payload) >= 6 + 2 + 2:
+                r = le16(payload, 0)
+                c_first = le16(payload, 2)
+                last_col = le16(payload, len(payload) - 2)
+                n = int(last_col) - int(c_first) + 1
+                pos = 4
+                for i in range(max(0, n)):
+                    if pos + 6 > len(payload) - 2:
+                        break
+                    rk = le32(payload, pos + 2)
+                    v = _fmt_num(_decode_rk(int(rk)))
+                    if v:
+                        c = int(c_first) + i
+                        cells[(r, c)] = v
+                        max_r = max(max_r, r)
+                        max_c = max(max_c, c)
+                    pos += 6
+
+            elif opcode == BOOLERR and len(payload) >= 8:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                val = payload[6]
+                is_err = payload[7]
+                if is_err == 0:
+                    v = "TRUE" if val else "FALSE"
+                    cells[(r, c)] = v
+                    max_r = max(max_r, r)
+                    max_c = max(max_c, c)
+
+            elif opcode == FORMULA and len(payload) >= 14:
+                r = le16(payload, 0)
+                c = le16(payload, 2)
+                # 결과가 숫자일 때만 반영(문자열/에러는 뒤 STRING 레코드 필요)
+                res = payload[6:14]
+                if len(res) == 8 and not (res[6] == 0xFF and res[7] == 0xFF):
+                    num = struct.unpack("<d", res)[0]
+                    v = _fmt_num(float(num))
+                    if v:
+                        cells[(r, c)] = v
+                        max_r = max(max_r, r)
+                        max_c = max(max_c, c)
+        except Exception:
+            continue
+
+    if max_r < 0 or max_c < 0:
+        return ""
+
+    max_r = min(int(max_r), max_rows - 1)
+    max_c = min(int(max_c), max_cols - 1)
+
+    lines: List[str] = []
+    for r in range(max_r + 1):
+        row = []
+        for c in range(max_c + 1):
+            v = cells.get((r, c), "")
+            row.append(str(v).replace("\t", " ").strip())
+        lines.append("\t".join(row).rstrip())
+
+    return "\n".join(lines).strip()
+
+
+def xls_table_text(wb: bytes, strings: List[str]) -> str:
+    enc = _parse_codepage(wb)
+    sheets = _parse_boundsheets(wb, enc)
+    if not sheets:
+        return ""
+
+    blocks: List[str] = []
+    for name, off in sheets[:3]:
+        tsv = _sheet_cells_to_tsv(wb, off, strings)
+        if not tsv.strip():
+            continue
+        blocks.append(f"[{name}]")
+        blocks.append(tsv)
+        blocks.append("")
+
+    return "\n".join(blocks).strip()
 
 
 # 본문 SST + CONTINUE 부분
@@ -301,6 +532,10 @@ def extract_text(file_bytes: bytes):
         else:
             strings = []
 
+        # 1) 표 형태 TSV(가능하면) -> UI에서 테이블로 렌더링
+        table = xls_table_text(wb, strings)
+
+        # 2) fallback 텍스트(기존 방식)
         body = extract_sst(wb, strings)
 
         header_texts: List[str] = []
@@ -315,13 +550,18 @@ def extract_text(file_bytes: bytes):
                     if item["text"]:
                         header_texts.append(item["text"])
 
-        combined_texts = body + header_texts
-        full_text = "\n".join(combined_texts)
+        # table이 있으면 "표"만 출력(중복 출력 방지)
+        if table.strip():
+            full_text = table.strip()
+        else:
+            combined_texts = body + header_texts
+            full_text = "\n".join(combined_texts)
 
         return {
             "body": body,
             "header_footer": header_texts,
             "full_text": full_text,
+            "markdown": full_text,
             "pages": [{"page": 1, "text": full_text}],
         }
 

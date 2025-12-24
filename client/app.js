@@ -547,6 +547,43 @@ function renderMarkdownToViewer(md, detections) {
 
   viewer.innerHTML = clean
   applyMarkdownTailwind(viewer)
+  stripEmailLinks(viewer)
+}
+
+function stripEmailLinks(viewer) {
+  if (!viewer) return
+  // 문서뷰어에서는 "이메일 형태"가 하이퍼링크로 남지 않도록 방지한다.
+  // - href 대소문자/변형(mailto:, MAILTO:, mailto:?subject=...) 케이스 대응
+  // - 앵커를 제거하되, 내부 하이라이트(span.pii-box 등)는 유지되도록 "unwrap" 처리
+  const emailRe = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
+
+  const unwrap = (a) => {
+    const p = a.parentNode
+    if (!p) return
+    while (a.firstChild) p.insertBefore(a.firstChild, a)
+    p.removeChild(a)
+  }
+
+  viewer.querySelectorAll('a[href]').forEach((a) => {
+    const href = String(a.getAttribute('href') || '').trim()
+    const hrefLow = href.toLowerCase()
+    const text = String(a.textContent || '').trim()
+
+    const looksEmail = emailRe.test(text)
+    const isMailto = hrefLow.startsWith('mailto:') || hrefLow.includes('mailto:')
+
+    // "이메일 텍스트"를 클릭 링크로 만들지 않기
+    if (isMailto && looksEmail) return unwrap(a)
+
+    // 일부 환경에서 href가 이메일 그대로/또는 https://email 형태로 붙는 경우까지 방어
+    if (
+      looksEmail &&
+      (hrefLow === text.toLowerCase() ||
+        hrefLow.replace(/^https?:\/\//, '') === text.toLowerCase())
+    ) {
+      return unwrap(a)
+    }
+  })
 }
 
 function applyMarkdownTailwind(viewer) {
