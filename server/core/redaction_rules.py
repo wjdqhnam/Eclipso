@@ -101,7 +101,7 @@ RULES = {
 # --- 사전 정의된 패턴 ---
 PRESET_PATTERNS = [
     {"name": "rrn",            "regex": RRN_RE.pattern,        "case_sensitive": False, "whole_word": False},
-    {"name": "fgn",            "regex": FGN_RE.pattern,        "case_sensitive": False, "whole_word": False},
+    {"name": "fgn",            "regex": FGN_RE.pattern,        "case_sensitive": False, "whole_word": False},  
     {"name": "email",          "regex": EMAIL_RE.pattern,      "case_sensitive": False, "whole_word": False},
     {"name": "phone_mobile",   "regex": MOBILE_RE.pattern,     "case_sensitive": False, "whole_word": False},
     {"name": "phone_city",     "regex": CITY_RE.pattern,       "case_sensitive": False, "whole_word": False},

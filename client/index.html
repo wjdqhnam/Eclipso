@@ -5,22 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Eclipso</title>
 
-    <!-- Tailwind & PDF.js -->
+    <!-- Tailwind & PDF-->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
+    <!-- Markdown renderer + sanitizer -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.3.1/dist/purify.min.js"></script>
+
     <script>
-      // API_BASE 자동 설정 (로컬/배포 공용)
+      // API_BASE 자동 설정
       const origin = window.location.origin
       window.API_BASE =
         origin.includes('127.0.0.1') || origin.includes('localhost')
           ? 'http://127.0.0.1:8000'
           : origin.replace(/\/$/, '')
-
-      // (선택) HWPX 뷰어 URL
-      window.HWPX_VIEWER_URL = window.HWPX_VIEWER_URL || ''
-
-      // pdf.js 워커 경로
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
     </script>
@@ -29,21 +28,23 @@
   <body class="bg-gray-50 text-gray-900">
     <!-- 상단바 -->
     <header class="border-b border-gray-200 bg-white/70 backdrop-blur">
-      <div
-        class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between"
-      >
+      <div class="w-full px-0 py-4 flex items-center justify-between">
         <div class="flex items-center gap-2">
-          <div class="h-6 w-6 rounded-full bg-blue-600"></div>
-          <h1 class="text-xl font-semibold tracking-tight">Eclipso</h1>
+          <h1 class="text-xl font-semibold tracking-tight ml-10">Eclipso</h1>
         </div>
-        <div class="text-sm text-gray-500">문서 개인정보 스캔 · 레닥션</div>
+        <div class="text-sm text-gray-500 mr-10">
+          문서 개인정보 스캔 · 레닥션
+        </div>
       </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-6 py-8">
-      <div class="grid grid-cols-1 lg:grid-cols-[320px,1fr] gap-8">
+    <main class="w-full px-6 py-8">
+      <div
+        id="layout-grid"
+        class="grid grid-cols-1 gap-8 lg:grid-cols-[320px_1fr_520px] lg:grid-rows-[auto_auto]"
+      >
         <!-- 왼쪽: 업로드·옵션 -->
-        <aside class="lg:sticky lg:top-6 self-start space-y-6">
+        <aside class="lg:sticky lg:top-6 self-start space-y-6 lg:row-span-2">
           <section
             class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 space-y-5"
           >
@@ -82,7 +83,7 @@
             <fieldset class="rounded-xl border border-gray-200 p-4">
               <legend class="px-1 text-sm font-medium">규칙 선택</legend>
               <div id="rules-container" class="mt-2 space-y-2 text-sm">
-                <!-- /text/rules 실패 시 기본값 -->
+                <!-- /text/rules 실패 시 기본값(유지) -->
                 <label class="flex items-center gap-2">
                   <input type="checkbox" name="rule" value="rrn" checked />
                   <span>주민등록번호</span>
@@ -156,7 +157,8 @@
             <div class="space-y-2">
               <button
                 id="btn-scan"
-                class="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition"
+                class="w-full px-4 py-2.5 rounded-lg text-white transition"
+                style="background-color: oklch(65.802% 0.05764 310.975)"
               >
                 스캔 실행
               </button>
@@ -176,171 +178,459 @@
           </section>
         </aside>
 
-        <!-- 오른쪽: 결과 -->
-        <section class="space-y-8">
-          <!-- 텍스트 미리보기 -->
+        <!-- 가운데/오른쪽/하단:  -->
+        <section class="contents">
+          <!-- 문서뷰어 -->
           <div
-            id="text-preview-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 hidden"
+            id="doc-viewer-block"
+            class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 hidden min-w-0 lg:col-start-2 lg:row-start-1"
           >
-            <h2 class="font-semibold mb-2">텍스트 미리보기</h2>
-            <textarea
-              id="txt-out"
-              class="w-full h-48 border rounded p-2 font-mono"
-              readonly
-            ></textarea>
+            <div class="flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <h2 class="font-semibold">문서뷰어</h2>
+                <div
+                  id="doc-meta"
+                  class="text-sm text-gray-500 mt-1 break-words"
+                >
+                  -
+                </div>
+              </div>
+              <span
+                id="doc-detect-count"
+                class="text-xs bg-gray-900 text-white px-2 py-0.5 rounded"
+                >0</span
+              >
+            </div>
+
+            <div class="mt-4">
+              <div id="doc-stage">
+                <div id="doc-page">
+                  <div
+                    id="doc-viewer"
+                    class="font-sans text-[13px] leading-[1.6] text-gray-900 break-words"
+                  ></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- app.js 호환용(숨김) -->
+            <div
+              id="doc-page-indicator"
+              class="hidden"
+              aria-hidden="true"
+            ></div>
+            <button
+              id="btn-page-prev"
+              class="hidden"
+              aria-hidden="true"
+            ></button>
+            <button
+              id="btn-page-next"
+              class="hidden"
+              aria-hidden="true"
+            ></button>
           </div>
 
-          <!-- 매칭 결과(토글) -->
+          <!-- 리스크 평가 리포트(통계) : prev2 그대로 -->
           <div
-            id="match-result-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
+            id="stats-report-block"
+            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden min-w-0 lg:col-start-2 lg:col-span-2 lg:row-start-2"
           >
-            <button
-              data-toggle="match"
-              class="w-full flex items-center justify-between px-5 py-3"
-            >
-              <h2 class="font-semibold">매칭 결과</h2>
-              <div class="flex items-center gap-3">
-                <span
-                  id="match-badge"
-                  class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
-                  >0</span
-                >
-                <svg
-                  data-chevron="match"
-                  class="h-5 w-5 text-gray-500 transition-transform"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-              </div>
-            </button>
-            <div id="match-body" class="p-5 border-t">
-              <div class="flex flex-wrap items-center gap-3 mb-4">
-                <div id="summary" class="text-sm text-gray-500"></div>
-                <span class="mx-2 text-gray-300">|</span>
-
-                <!-- 세그먼트 필터: All / OK / FAIL -->
+            <div class="px-5 py-4 flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <h2 class="font-semibold">평가 리포트</h2>
                 <div
-                  class="inline-flex rounded-lg border border-gray-200 overflow-hidden"
+                  id="stats-subtitle"
+                  class="text-sm text-gray-500 mt-1 break-words"
                 >
-                  <button
-                    id="seg-all"
-                    data-seg="all"
-                    class="px-3 py-1.5 text-xs bg-gray-900 text-white"
+                  -
+                </div>
+              </div>
+              <div class="shrink-0 flex items-center gap-2">
+                <button
+                  id="btn-stats-download"
+                  type="button"
+                  class="text-xs px-2 py-1 rounded-lg bg-gray-900 text-white hover:bg-gray-800 transition"
+                >
+                  리포트 다운로드
+                </button>
+                <button
+                  id="btn-stats-json-toggle"
+                  type="button"
+                  class="text-xs px-2 py-1 rounded-lg border border-gray-300 hover:bg-gray-50 transition"
+                >
+                  JSON
+                </button>
+              </div>
+            </div>
+
+            <div class="border-t p-5 space-y-6">
+              <!-- 상단 KPI -->
+              <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <!-- Risk Score -->
+                <div class="rounded-2xl border border-gray-200 p-4 bg-gray-50">
+                  <div class="text-xs text-gray-500">민감정보 비율</div>
+                  <div class="mt-1 flex items-end justify-between gap-3">
+                    <div
+                      id="stats-risk-score"
+                      class="text-3xl font-semibold tracking-tight"
+                    >
+                      0
+                    </div>
+                    <div class="text-xs text-gray-500">/ 100</div>
+                  </div>
+                  <div class="mt-3 h-2 rounded bg-gray-200 overflow-hidden">
+                    <div
+                      id="stats-risk-meter"
+                      class="h-2"
+                      style="
+                        width: 0%;
+                        background-color: oklch(62.7% 0.265 303.9);
+                      "
+                    ></div>
+                  </div>
+                  <div
+                    id="stats-risk-note"
+                    class="mt-2 text-[11px] text-gray-500"
                   >
-                    All
-                  </button>
-                  <button
-                    id="seg-ok"
-                    data-seg="ok"
-                    class="px-3 py-1.5 text-xs text-emerald-700 hover:bg-emerald-50"
-                  >
-                    OK
-                  </button>
-                  <button
-                    id="seg-fail"
-                    data-seg="fail"
-                    class="px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50"
-                  >
-                    FAIL
-                  </button>
+                    -
+                  </div>
                 </div>
 
-                <input
-                  id="filter-search"
-                  type="text"
-                  placeholder="텍스트 검색"
-                  class="text-sm border rounded px-2 py-1"
-                  style="min-width: 220px"
-                />
+                <!-- Unique detections -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">총 탐지 (Unique)</div>
+                  <div
+                    id="stats-total-unique"
+                    class="mt-1 text-3xl font-semibold tracking-tight"
+                  >
+                    0
+                  </div>
+                  <div class="mt-2 text-[11px] text-gray-500">
+                    <span class="text-gray-400">Raw:</span>
+                    <span id="stats-total-raw">0</span>
+                    <span class="mx-1 text-gray-300">|</span>
+                    <span class="text-gray-400">Overlap:</span>
+                    <span id="stats-overlap-rate">0%</span>
+                  </div>
+                  <div class="mt-3 pt-3 border-t border-gray-100">
+                    <div class="flex items-center gap-4 text-[11px]">
+                      <div>
+                        <span class="text-gray-400">정규식:</span>
+                        <span
+                          id="stats-regex-unique"
+                          class="ml-1 font-semibold text-gray-900"
+                          >0</span
+                        >
+                      </div>
+                      <div>
+                        <span class="text-gray-400">NER:</span>
+                        <span
+                          id="stats-ner-unique"
+                          class="ml-1 font-semibold text-gray-900"
+                          >0</span
+                        >
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Regex OK/FAIL + FAIL 분석 -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">정규식 검증</div>
+
+                  <div class="mt-2 flex items-center gap-2">
+                    <span
+                      class="text-[11px] px-2 py-1 rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700"
+                    >
+                      OK <span id="stats-regex-ok" class="font-mono">0</span>
+                    </span>
+                    <span
+                      class="text-[11px] px-2 py-1 rounded-full border border-rose-200 bg-rose-50 text-rose-700"
+                    >
+                      FAIL
+                      <span id="stats-regex-fail" class="font-mono">0</span>
+                    </span>
+                  </div>
+
+                  <div class="mt-3 text-[11px] text-gray-500">FAIL 원인</div>
+                  <div
+                    id="stats-fail-top"
+                    class="mt-1 text-[12px] text-gray-900 leading-relaxed"
+                  >
+                    -
+                  </div>
+
+                  <div class="mt-2 text-[11px] text-gray-500">
+                    valid=false 항목만 집계
+                  </div>
+                </div>
+
+                <!-- NER Avg -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">NER 평균 Score</div>
+                  <div
+                    id="stats-ner-avg"
+                    class="mt-1 text-sm font-medium text-gray-900"
+                  >
+                    PS - / LC - / OG -
+                  </div>
+                  <div class="mt-2 text-[11px] text-gray-500">
+                    선택된 라벨만 반영
+                  </div>
+                </div>
               </div>
-              <div id="match-groups" class="space-y-3"></div>
+
+              <!-- 정책/처리시간 -->
+              <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <!-- 정책: 칩 -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">정책</div>
+
+                  <div class="mt-2">
+                    <div class="text-[12px] text-gray-500 mb-1">
+                      정규식 규칙
+                    </div>
+                    <div
+                      id="stats-policy-rules"
+                      class="flex flex-wrap gap-1"
+                    ></div>
+                  </div>
+
+                  <div class="mt-3">
+                    <div class="text-[12px] text-gray-500 mb-1">NER 라벨</div>
+                    <div
+                      id="stats-policy-nerlabels"
+                      class="flex flex-wrap gap-1"
+                    ></div>
+                  </div>
+                </div>
+
+                <!-- 처리시간: 표 -->
+                <div class="rounded-2xl border border-gray-200 p-4">
+                  <div class="text-xs text-gray-500">처리 시간</div>
+
+                  <div
+                    class="mt-2 overflow-auto rounded-xl border border-gray-200"
+                  >
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-3">Step</th>
+                          <th class="text-right py-2 px-3">Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">extract</td>
+                          <td
+                            id="t-extract"
+                            class="py-2 px-3 text-right font-mono"
+                          >
+                            -
+                          </td>
+                        </tr>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">match</td>
+                          <td
+                            id="t-match"
+                            class="py-2 px-3 text-right font-mono"
+                          >
+                            -
+                          </td>
+                        </tr>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">ner</td>
+                          <td id="t-ner" class="py-2 px-3 text-right font-mono">
+                            -
+                          </td>
+                        </tr>
+                        <tr class="border-b">
+                          <td class="py-2 px-3">redact</td>
+                          <td
+                            id="t-redact"
+                            class="py-2 px-3 text-right font-mono"
+                          >
+                            -
+                          </td>
+                        </tr>
+                        <tr>
+                          <td class="py-2 px-3 font-semibold">total</td>
+                          <td
+                            id="t-total"
+                            class="py-2 px-3 text-right font-mono font-semibold"
+                          >
+                            -
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 표: by_kind / by_label -->
+              <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <div>
+                  <div class="text-sm font-semibold mb-2">유형별 건수</div>
+                  <div class="overflow-auto rounded-xl border border-gray-200">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-3">Type</th>
+                          <th class="text-right py-2 px-3">Count</th>
+                        </tr>
+                      </thead>
+                      <tbody id="stats-by-kind-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+                <div>
+                  <div class="text-sm font-semibold mb-2">라벨별 건수</div>
+                  <div class="overflow-auto rounded-xl border border-gray-200">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-3">Label</th>
+                          <th class="text-right py-2 px-3">Count</th>
+                        </tr>
+                      </thead>
+                      <tbody id="stats-by-label-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <pre
+                id="stats-json"
+                class="hidden text-xs bg-gray-50 border border-gray-200 rounded-xl p-3 overflow-auto"
+              ></pre>
             </div>
           </div>
 
-          <!-- NER 결과(토글) -->
-          <div
-            id="ner-result-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
-          >
-            <button
-              data-toggle="ner"
-              class="w-full flex items-center justify-between px-5 py-3"
+          <!-- 오른쪽: 매칭결과-->
+          <div class="min-w-0 lg:col-start-3 lg:row-start-1">
+            <div
+              id="match-tabs-block"
+              class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden max-h-[calc(100vh-160px)] overflow-hidden flex flex-col"
             >
-              <h2 class="font-semibold">NER 결과</h2>
-              <div class="flex items-center gap-3">
-                <span
-                  id="ner-badge"
-                  class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
-                  >0</span
-                >
-                <svg
-                  data-chevron="ner"
-                  class="h-5 w-5 text-gray-500 transition-transform"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
+              <div class="px-5 py-3 flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2 min-w-0">
+                  <h2 class="font-semibold truncate">매칭 결과</h2>
+                  <span
+                    id="match-tab-label"
+                    class="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-700"
+                    >정규식</span
+                  >
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                  <span
+                    id="match-badge"
+                    class="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded"
+                    >0</span
+                  >
+                  <button
+                    id="btn-match-prev"
+                    type="button"
+                    class="h-7 w-7 rounded-lg border border-gray-200 hover:bg-gray-50"
+                    aria-label="이전(정규식/NER)"
+                  >
+                    &lt;
+                  </button>
+                  <button
+                    id="btn-match-next"
+                    type="button"
+                    class="h-7 w-7 rounded-lg border border-gray-200 hover:bg-gray-50"
+                    aria-label="다음(정규식/NER)"
+                  >
+                    &gt;
+                  </button>
+                </div>
               </div>
-            </button>
-            <div id="ner-body" class="p-5 border-t">
-              <div id="ner-summary" class="text-sm text-gray-500 mb-3"></div>
-              <div class="overflow-auto">
-                <table class="min-w-full text-sm">
-                  <thead>
-                    <tr class="border-b bg-gray-50">
-                      <th class="text-left py-2 px-2">Label</th>
-                      <th class="text-left py-2 px-2">Text</th>
-                      <th class="text-left py-2 px-2">Score</th>
-                      <th class="text-left py-2 px-2">Pos</th>
-                    </tr>
-                  </thead>
-                  <tbody id="ner-rows"></tbody>
-                </table>
-              </div>
-            </div>
-          </div>
 
-          <!-- PDF 미리보기(토글) -->
-          <div
-            id="pdf-preview-block"
-            class="bg-white rounded-2xl shadow-sm border border-gray-100 hidden"
-          >
-            <button
-              data-toggle="pdf"
-              class="w-full flex items-center justify-between px-5 py-3"
-            >
-              <h2 class="font-semibold">레닥션 미리보기 (PDF)</h2>
-              <svg
-                data-chevron="pdf"
-                class="h-5 w-5 text-gray-500 transition-transform"
-                viewBox="0 0 20 20"
-                fill="currentColor"
+              <!-- 정규식 pane -->
+              <div
+                id="match-pane-regex"
+                class="border-t flex-1 min-h-0 flex flex-col"
               >
-                <path
-                  fill-rule="evenodd"
-                  d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.7a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z"
-                  clip-rule="evenodd"
-                />
-              </svg>
-            </button>
-            <div id="pdf-body" class="p-5 border-t hidden">
-              <canvas
-                id="pdf-preview"
-                class="w-full rounded border border-gray-200"
-              ></canvas>
+                <div
+                  id="match-body"
+                  class="p-5 flex-1 min-h-0 overflow-hidden flex flex-col"
+                >
+                  <div class="flex flex-wrap items-center gap-3 mb-4">
+                    <div id="summary" class="text-sm text-gray-500"></div>
+                    <span class="mx-2 text-gray-300">|</span>
+                    <div
+                      class="inline-flex rounded-lg border border-gray-200 overflow-hidden"
+                    >
+                      <button
+                        id="seg-all"
+                        data-seg="all"
+                        type="button"
+                        class="px-3 py-1.5 text-xs bg-gray-900 text-white"
+                      >
+                        All
+                      </button>
+                      <button
+                        id="seg-ok"
+                        data-seg="ok"
+                        type="button"
+                        class="px-3 py-1.5 text-xs text-emerald-700 hover:bg-emerald-50"
+                      >
+                        OK
+                      </button>
+                      <button
+                        id="seg-fail"
+                        data-seg="fail"
+                        type="button"
+                        class="px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50"
+                      >
+                        FAIL
+                      </button>
+                    </div>
+                    <input
+                      id="filter-search"
+                      type="text"
+                      placeholder="텍스트 검색"
+                      class="text-sm border rounded px-2 py-1 min-w-[220px]"
+                    />
+                  </div>
+
+                  <div
+                    id="match-groups"
+                    class="flex-1 min-h-0 overflow-auto space-y-3 pr-1"
+                  ></div>
+                </div>
+              </div>
+
+              <!-- NER pane -->
+              <div
+                id="match-pane-ner"
+                class="border-t hidden flex-1 min-h-0 flex flex-col"
+              >
+                <div
+                  id="ner-body"
+                  class="p-5 flex-1 min-h-0 overflow-hidden flex flex-col"
+                >
+                  <div
+                    id="ner-summary"
+                    class="text-sm text-gray-500 mb-3"
+                  ></div>
+                  <div class="flex-1 min-h-0 overflow-auto pr-1">
+                    <table class="min-w-full text-sm">
+                      <thead>
+                        <tr class="border-b bg-gray-50">
+                          <th class="text-left py-2 px-2">Label</th>
+                          <th class="text-left py-2 px-2">Text</th>
+                          <th class="text-left py-2 px-2">Score</th>
+                          <th class="text-left py-2 px-2">Pos</th>
+                        </tr>
+                      </thead>
+                      <tbody id="ner-rows"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </section>

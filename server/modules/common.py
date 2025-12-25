@@ -3,15 +3,23 @@ import io
 import re
 import zipfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from typing import List, Tuple, Optional, Callable
 
-from server.core.redaction_rules import PRESET_PATTERNS, RULES
+try:
+    from ..core.redaction_rules import PRESET_PATTERNS, RULES
+except Exception:  # pragma: no cover
+    from server.core.redaction_rules import PRESET_PATTERNS, RULES  # type: ignore
 
 __all__ = [
     "cleanup_text",
+    "cleanup_text_keep_tabs",
     "compile_rules",
     "sub_text_nodes",
+    "mask_literals_in_xml_text_nodes",
     "chart_sanitize",
+    "chart_rels_sanitize",
+    "sanitize_docx_content_types",
     "xlsx_text_from_zip",
     "redact_embedded_xlsx_bytes",
     "HWPX_STRIP_PREVIEW",
@@ -37,7 +45,19 @@ def cleanup_text(text: str) -> str:
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
 
-# 정규식 룰 컴파일(+우선순위/validator)
+def cleanup_text_keep_tabs(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        t = unicodedata.normalize("NFKC", t)
+    except Exception:
+        pass
+    t = re.sub(r"[ ]+\n", "\n", t)       
+    t = re.sub(r"\n{3,}", "\n\n", t)     
+    t = re.sub(r"[ ]{2,}", " ", t)       
+    return t.strip()
+
 _RULE_PRIORITY = {
     "card": 100, "email": 90, "rrn": 80, "fgn": 80,
     "phone_mobile": 60, "phone_city": 60,
@@ -102,21 +122,21 @@ def _mask_email(v: str) -> str:
     return _mask_preserving_entities(v, _m)
 
 def _mask_keep_rules(v: str) -> str:
-    def _m(ch: str) -> str:
+    def _mask(ch: str) -> str:
         if ch == "-":
             return ch
         if ch.isalnum() or ch in "._":
             return "*"
         return ch
-    return _mask_preserving_entities(v, _m)
+    return _mask_preserving_entities(v, _mask)
 
 def _mask_value(rule: str, v: str) -> str:
     return _mask_email(v) if (rule or "").lower() == "email" else _mask_keep_rules(v)
 
 # 매칭 스팬 수집/필터/적용
 def _collect_spans(src: str, comp) -> tuple[List[tuple], List[tuple]]:
-    allowed: List[tuple] = []
-    forbidden: List[tuple] = []
+    allowed: List[tuple] = []  
+    forbidden: List[tuple] = [] 
     for name, rx, need_valid, prio, validator in comp:
         for m in rx.finditer(src):
             s, e = m.span()
@@ -153,9 +173,70 @@ def _apply_spans(src: str, allowed) -> tuple[str, int]:
 
 # XML 텍스트 노드 마스킹
 _TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.DOTALL)
+_XML_DECL_ENC_RE = re.compile(br'encoding\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _detect_xml_encoding(xml_bytes: bytes) -> tuple[str, bytes]:
+    """
+    XML 바이트의 인코딩을 최대한 보수적으로 감지해서 (encoding, bom_bytes)를 반환.
+    - utf-16/utf-8 BOM을 우선
+    - (BOM 없을 때) XML 선언부 encoding=...을 ASCII 범위에서 탐색
+    """
+    if not xml_bytes:
+        return "utf-8", b""
+
+    # BOM 우선
+    if xml_bytes.startswith(b"\xEF\xBB\xBF"):
+        return "utf-8", b"\xEF\xBB\xBF"
+    if xml_bytes.startswith(b"\xFF\xFE"):
+        return "utf-16le", b"\xFF\xFE"
+    if xml_bytes.startswith(b"\xFE\xFF"):
+        return "utf-16be", b"\xFE\xFF"
+
+    # XML 선언부는 보통 ASCII라서 앞부분만 스캔
+    head = xml_bytes[:256]
+    try:
+        m = _XML_DECL_ENC_RE.search(head)
+        if m:
+            enc = (m.group(1) or b"").decode("ascii", "ignore").strip().lower()
+            if enc:
+                # python codec alias 보정
+                if enc in ("utf8",):
+                    enc = "utf-8"
+                if enc in ("utf16",):
+                    # BOM 없을 때 utf-16은 endianness 추정이 어려우니 우선 utf-8로 fallback
+                    return "utf-8", b""
+                return enc, b""
+    except Exception:
+        pass
+
+    return "utf-8", b""
+
+
+def _xml_bytes_to_text(xml_bytes: bytes) -> tuple[str, str, bytes]:
+    enc, bom = _detect_xml_encoding(xml_bytes)
+    try:
+        if bom and enc == "utf-8":
+            # utf-8-sig처럼 BOM 제거 후 디코드
+            return xml_bytes[len(bom) :].decode("utf-8", "ignore"), "utf-8", bom
+        return xml_bytes.decode(enc, "ignore"), enc, bom
+    except Exception:
+        # 최후의 fallback
+        return xml_bytes.decode("utf-8", "ignore"), "utf-8", b""
+
+
+def _xml_text_to_bytes(text: str, enc: str, bom: bytes) -> bytes:
+    try:
+        if enc in ("utf-16le", "utf-16be") and bom:
+            return bom + (text or "").encode(enc, "ignore")
+        if enc == "utf-8" and bom:
+            return bom + (text or "").encode("utf-8", "ignore")
+        return (text or "").encode(enc, "ignore")
+    except Exception:
+        return (text or "").encode("utf-8", "ignore")
 
 def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
-    s = xml_bytes.decode("utf-8", "ignore")
+    s, enc, bom = _xml_bytes_to_text(xml_bytes)
     all_allowed: List[tuple] = []
     all_forbidden: List[tuple] = []
     for m in _TEXT_NODE_RE.finditer(s):
@@ -170,7 +251,90 @@ def sub_text_nodes(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
             all_forbidden.append((base + f_s, base + f_e))
     all_allowed = _filter_allowed_by_forbidden(all_allowed, all_forbidden)
     masked, hits = _apply_spans(s, all_allowed)
-    return masked.encode("utf-8", "ignore"), hits
+    return _xml_text_to_bytes(masked, enc, bom), hits
+
+def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
+    if not xml_bytes or not literals:
+        return xml_bytes
+
+    s, enc, bom = _xml_bytes_to_text(xml_bytes)
+
+    lits = [str(x) for x in literals if isinstance(x, str) and x.strip()]
+    if not lits:
+        return xml_bytes
+    lits = sorted(set(lits), key=lambda x: (-len(x), x))
+
+    def _mask_literal(v: str) -> str:
+        vv = (v or "").strip()
+        if "@" in vv and "." in vv.split("@", 1)[-1]:
+            return _mask_email(vv)
+        return _mask_keep_rules(vv)
+
+    def _apply_to_segment(seg: str) -> str:
+        out = seg
+        for lit in lits:
+            if not lit or len(lit) < 2:
+                continue
+            if lit in out:
+                out = out.replace(lit, _mask_literal(lit))
+        return out
+
+    # 텍스트 노드 영역만 치환
+    pieces: List[str] = []
+    last = 0
+    for m in _TEXT_NODE_RE.finditer(s):
+        pieces.append(s[last:m.start(1)])
+        pieces.append(_apply_to_segment(m.group(1)))
+        last = m.end(1)
+    pieces.append(s[last:])
+
+    out_s = "".join(pieces)
+    if out_s == s:
+        return xml_bytes
+    return _xml_text_to_bytes(out_s, enc, bom)
+
+def mask_literals_in_xml_text_nodes(xml_bytes: bytes, literals: List[str]) -> bytes:
+    if not xml_bytes or not literals:
+        return xml_bytes
+
+    try:
+        s = xml_bytes.decode("utf-8", "ignore")
+    except Exception:
+        return xml_bytes
+
+    lits = [str(x) for x in literals if isinstance(x, str) and x.strip()]
+    if not lits:
+        return xml_bytes
+    lits = sorted(set(lits), key=lambda x: (-len(x), x))
+
+    def _mask_literal(v: str) -> str:
+        vv = (v or "").strip()
+        if "@" in vv and "." in vv.split("@", 1)[-1]:
+            return _mask_email(vv)
+        return _mask_keep_rules(vv)
+
+    def _apply_to_segment(seg: str) -> str:
+        out = seg
+        for lit in lits:
+            if not lit or len(lit) < 2:
+                continue
+            if lit in out:
+                out = out.replace(lit, _mask_literal(lit))
+        return out
+
+    # 텍스트 노드 영역만 치환
+    pieces: List[str] = []
+    last = 0
+    for m in _TEXT_NODE_RE.finditer(s):
+        pieces.append(s[last:m.start(1)])
+        pieces.append(_apply_to_segment(m.group(1)))
+        last = m.end(1)
+    pieces.append(s[last:])
+
+    out_s = "".join(pieces)
+    if out_s == s:
+        return xml_bytes
+    return out_s.encode("utf-8", "ignore")
 
 # 차트 라벨/값 마스킹(XML)
 def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
@@ -180,7 +344,36 @@ def chart_sanitize(xml_bytes: bytes, comp) -> Tuple[bytes, int]:
 def sanitize_docx_content_types(xml_bytes: bytes) -> bytes:
     return xml_bytes
 
-# XLSX 텍스트 수집(sharedStrings/worksheets/charts)
+# DOCX chart relationships(.rels) sanitize
+def chart_rels_sanitize(xml_bytes: bytes) -> bytes:
+    try:
+        s = xml_bytes.decode("utf-8", "ignore")
+        if ("TargetMode" not in s) and ("External" not in s) and ("http" not in s) and ("file:" not in s):
+            return xml_bytes
+
+        root = ET.fromstring(s)
+        removed = False
+        for rel in list(root):
+            try:
+                attrs = rel.attrib or {}
+                target_mode = (attrs.get("TargetMode") or attrs.get("targetMode") or "").strip().lower()
+                target = (attrs.get("Target") or attrs.get("target") or "").strip()
+                t_low = target.lower()
+                is_external = (target_mode == "external") or t_low.startswith(("http://", "https://", "file:", "mailto:"))
+                if is_external:
+                    root.remove(rel)
+                    removed = True
+            except Exception:
+                continue
+
+        if not removed:
+            return xml_bytes
+        out = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return out if isinstance(out, (bytes, bytearray)) else xml_bytes
+    except Exception:
+        return xml_bytes
+
+# XLSX 텍스트 수정
 def xlsx_text_from_zip(zipf: zipfile.ZipFile) -> str:
     out: List[str] = []
     try:
@@ -211,7 +404,8 @@ def redact_embedded_xlsx_bytes(xlsx_bytes: bytes) -> bytes:
     comp = compile_rules()
     bio_in = io.BytesIO(xlsx_bytes)
     bio_out = io.BytesIO()
-    with zipfile.ZipFile(bio_in, "r") as zin, zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
+    with zipfile.ZipFile(bio_in, "r") as zin, \
+        zipfile.ZipFile(bio_out, "w", zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
             name = it.filename
             data = zin.read(name)

@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
 from server.core.schemas import DetectResponse, PatternItem, Box
-from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
+from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction,extract_table_layout    
 from server.core.redaction_rules import PRESET_PATTERNS
 from server.modules.common import compile_rules
 
@@ -45,9 +45,12 @@ def _read_pdf(file: UploadFile) -> bytes:
         raise HTTPException(status_code=500, detail=f"PDF 읽기 실패: {e}")
 
 
-def _load_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    if not patterns_json:
-        # 없는 경우 기본 PRESET_PATTERNS 사용
+def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
+    if patterns_json is None:
+        return [PatternItem(**p) for p in PRESET_PATTERNS]
+
+    s = str(patterns_json).strip()
+    if not s or s.lower() in ("null", "none"):
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
     try:
@@ -75,7 +78,31 @@ def _load_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
     try:
         return [PatternItem(**p) for p in arr]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"잘못된 PatternItem 형식: {e}")
+        raise HTTPException(status_code=400, detail=f"잘못된 patterns 항목: {e}")
+
+
+def _compile_patterns(items: List[PatternItem]) -> List[Any]:
+    compiled: List[Any] = []
+    for it in items:
+        # PatternItem 속성 추출
+        try:
+            regex = getattr(it, "regex")
+        except AttributeError:
+            raise HTTPException(status_code=400, detail="PatternItem에 'regex' 누락")
+
+        try:
+            rp = re.compile(regex)
+        except re.error as e:
+            name_for_msg = getattr(it, "name", getattr(it, "label", "UNKNOWN"))
+            raise HTTPException(
+                status_code=400, detail=f"정규식 컴파일 실패({name_for_msg}): {e}"
+            )
+
+        # 네임스페이스로 래핑(+ compiled)
+        ns = types.SimpleNamespace(**it.dict())
+        setattr(ns, "compiled", rp)
+        compiled.append(ns)
+    return compiled
 
 
 @router.post(
@@ -139,8 +166,6 @@ def match_text(text: str):
     try:
         if not isinstance(text, str):
             text = str(text)
-
-        # 공통 규칙 컴파일 (name, regex, need_valid, prio, validator)
         comp = compile_rules()
 
         matches: List[Dict[str, Any]] = []
@@ -188,3 +213,31 @@ def match_text(text: str):
     except Exception as e:
         log.exception("match_text 내부 오류")
         raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")
+
+@router.post(
+    "/redactions/tables",
+    summary="PDF 표 레이아웃 탐지",
+    description=(
+        "pymupdf4llm으로 PDF 내 표 위치와 행/열 개수만 탐지\n"
+        "- 입력: file(PDF)\n"
+        "- 출력: { tables: [ { page, bbox, row_count, col_count }, ... ] }"
+    ),
+)
+async def detect_tables(
+    file: UploadFile = File(..., description="PDF 파일"),
+):
+    # 기존 유틸 재사용
+    _ensure_pdf(file)
+    pdf_bytes = _read_pdf(file)
+
+    # pdf_module.extract_table_layout 호출
+    try:
+        data = extract_table_layout(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"표 레이아웃 추출 중 오류: {e}",
+        )
+
+    # 그대로 JSON 반환
+    return data
