@@ -19,9 +19,7 @@ def le32(b: bytes, off: int) -> int:
     return struct.unpack_from("<I", b, off)[0]
 
 
-# ─────────────────────────────
 # Word 구조 읽기
-# ─────────────────────────────
 def get_table_stream(word_data: bytes, ole: olefile.OleFileIO) -> Optional[str]:
     fib_flags = le16(word_data, 0x000A)
     fWhichTblStm = (fib_flags & 0x0200) != 0
@@ -30,7 +28,6 @@ def get_table_stream(word_data: bytes, ole: olefile.OleFileIO) -> Optional[str]:
 
 
 def read_streams(file_bytes: bytes) -> Tuple[Optional[bytes], Optional[bytes]]:
-    """WordDocument / Table 스트림 모두 읽기"""
     try:
         with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
             if not ole.exists("WordDocument"):
@@ -43,9 +40,7 @@ def read_streams(file_bytes: bytes) -> Tuple[Optional[bytes], Optional[bytes]]:
         return None, None
 
 
-# ─────────────────────────────
 # PlcPcd / CLX 파싱
-# ─────────────────────────────
 def get_clx_data(word_data: bytes, table_data: bytes) -> Optional[bytes]:
     fcClx, lcbClx = le32(word_data, 0x01A2), le32(word_data, 0x01A6)
     if not table_data or fcClx + lcbClx > len(table_data):
@@ -71,7 +66,6 @@ def extract_plcpcd(clx: bytes) -> bytes:
 
 
 def parse_plcpcd(plcpcd: bytes) -> List[Dict[str, Any]]:
-    """PlcPcd 구조를 CP 구간 / fc 기반으로 파싱"""
     size = len(plcpcd)
     if size < 4 or (size - 4) % 12 != 0:
         return []
@@ -174,16 +168,7 @@ def split_matches(matches, text):
 
 
 
-# ─────────────────────────────
-# 동일 길이 마스킹(문장부호 일부 유지)
-#  - DOC(.doc) 는 바이너리 포맷이라 길이가 바뀌면 구조가 깨질 수 있어
-#    "동일 길이" 마스킹만 허용한다.
-#  - 다른 OOXML 모듈(docx/pptx/xlsx/hwpx)에서 쓰는 정책과 최대한 맞춘다.
-#    (이메일은 '@', '-' 유지 / 그 외는 '-' 유지)
-# ─────────────────────────────
-
 def _mask_keep_rules(v: str) -> str:
-    # 알파뉴메릭과 일부 구분자만 가리고, '-' 등 문장부호는 유지
     out = []
     for ch in v:
         if ch == '-':
@@ -196,7 +181,6 @@ def _mask_keep_rules(v: str) -> str:
 
 
 def _mask_email(v: str) -> str:
-    # 엔티티(&amp; 등) 내 글자는 가리지 않는다(OOXML 대비)
     out = []
     in_entity = False
     for ch in v:
@@ -226,14 +210,7 @@ def _mask_value(rule: str, v: str) -> str:
 
 # Word 본문 레닥션
 def replace_text(file_bytes: bytes, targets: list[tuple[int, int, str]], replacement_char: str = "*") -> bytes:
-    """WordDocument 스트림의 텍스트 영역을 동일 길이로 마스킹한다.
 
-    targets: (start_cp, end_cp, rule)
-      - start_cp/end_cp: WordDocument CP 기준(추출된 raw_text 기준) 범위
-      - rule: 정규식 rule 키(예: phone_mobile, email, rrn ...)
-
-    주의: DOC는 바이너리 포맷이라 "길이가 바뀌는" 수정은 파일을 깨뜨릴 수 있다.
-    """
     try:
         word_data, table_data = read_streams(file_bytes)
         if not word_data or not table_data:
@@ -265,7 +242,7 @@ def replace_text(file_bytes: bytes, targets: list[tuple[int, int, str]], replace
                 byte_start = fc_base + (local_start - text_start) * bpc
                 byte_len = (local_end - local_start) * bpc
 
-                # 원본 구간을 문자열로 복원한 뒤, 규칙별로 "동일 길이" 마스킹
+                # 원본 구간을 문자열로 복원한 뒤, 규칙별로 동일 길이 마스킹
                 seg_bytes = bytes(replaced[byte_start:byte_start + byte_len])
                 if bpc == 2:
                     seg_text = seg_bytes.decode("utf-16le", errors="replace")
@@ -276,7 +253,7 @@ def replace_text(file_bytes: bytes, targets: list[tuple[int, int, str]], replace
                     masked_text = _mask_value(rule, seg_text)
                     masked_bytes = masked_text.encode("latin-1", errors="replace")
 
-                # 안전장치: 길이가 달라지면 기존 방식(전부 마스킹)으로 폴백
+                # 길이가 달라지면 기존 방식(전부 마스킹)으로 폴백
                 if len(masked_bytes) != byte_len:
                     mask = (
                         replacement_char.encode("utf-16le")[:2] * (byte_len // 2)
@@ -356,7 +333,6 @@ def _collect_fat_sectors(data: bytes, sector_size: int) -> List[int]:
     if difat_start in (_FREESECT, _ENDOFCHAIN) or num_difat == 0:
         return fat_sectors
 
-    # DIFAT sector contains (sector_size/4 - 1) FAT sector indices + last = next DIFAT sector
     next_difat = int(difat_start)
     visited = set()
     for _ in range(int(num_difat) + 1):
@@ -449,7 +425,6 @@ def _overwrite_stream_in_ole(original_file_bytes: bytes, stream_name: str, new_s
     if int(stream_size) != len(new_stream_bytes):
         return original_file_bytes
 
-    # in-place overwrite: only write stream_size bytes, keep the rest of last sector untouched
     out = bytearray(data)
     pos = 0
     for s in _iter_fat_chain(start_sector, fat):
@@ -511,7 +486,6 @@ def redact_word_document(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]
                     continue
                 span_ranges.append((s, e))
         if span_ranges:
-            # find_sensitive_spans와 동일 포맷으로 합치기(값은 참고용)
             for s, e in span_ranges:
                 matches.append((s, e, norm_text[s:e], "SPAN"))
 

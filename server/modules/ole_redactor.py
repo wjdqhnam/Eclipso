@@ -52,13 +52,9 @@ def _is_cfbf(h: bytes) -> bool:
     return h.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")
 
 
-# --------- 동일 길이 치환 유틸(시크릿/이메일) ---------
+# 동일 길이 치환 유틸(시크릿/이메일) 
 def utf16_same_len_replace_with_logs(data: bytes, old: str):
-    """UTF-16LE 동일 길이 치환.
 
-    - 기본은 '*'로 마스킹
-    - 단, '-' / '@' (및 전각 '＠')는 원문 그대로 유지
-    """
     old_u16 = old.encode("utf-16le")
     ba = bytearray(data)
     cnt = 0
@@ -71,7 +67,7 @@ def utf16_same_len_replace_with_logs(data: bytes, old: str):
     masked = "".join(ch if ch in KEEP else "*" for ch in old)
     repl_u16 = masked.encode("utf-16le")
 
-    # (안전) surrogate pair 등으로 길이가 달라지면 구버전처럼 전체 마스킹
+    # surrogate pair 등으로 길이가 달라지면 구버전처럼 전체 마스킹
     if len(repl_u16) != n:
         repl_u16 = ("*" * (n // 2)).encode("utf-16le")
 
@@ -385,10 +381,10 @@ def redact_ole_bin_preserve_size(
     if not _is_cfbf(header):
         idx = bytes(bin_bytes).find(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")
         if idx < 0:
-            return bytes(bin_bytes)  # CFBF 아님
+            return bytes(bin_bytes)  
         prefix_off = idx
 
-    container = bytearray(bin_bytes)  # 수정 가능한 버퍼
+    container = bytearray(bin_bytes) 
     base = memoryview(container)[prefix_off:]
     dump_dir = _prepare_dump_dir()
     if dump_dir:
@@ -421,7 +417,6 @@ def redact_ole_bin_preserve_size(
                 log.warning("  · %s open 실패: %s", sname, e)
                 continue
 
-            # direntry 메타
             de_start = -1
             de_size = len(raw)
             is_mini = de_size < cutoff
@@ -455,12 +450,12 @@ def redact_ole_bin_preserve_size(
             changed = raw
             did_force_blank = False
 
-            # (A) 강제 제로필 대상
+            # 강제 제로필 대상
             if _need_force_blank(sname):
                 changed = b"\x00" * len(raw)
                 did_force_blank = True
             else:
-                # (B) 일반 파이프라인: 시크릿/이메일 동일 길이 마스킹
+                # 일반 파이프라인: 시크릿/이메일 동일 길이 마스킹
                 u16_hits = 0
                 ascii_hits = 0
                 g_ascii = 0
@@ -490,7 +485,7 @@ def redact_ole_bin_preserve_size(
             wrote = 0
             start_used: Optional[str] = None
 
-            # (1) direntry 기반 쓰기
+            # direntry 기반 쓰기
             if de_start is not None and de_start >= 0:
                 if is_mini:
                     wrote = overwrite_minifat_chain(ole, base.obj, de_start, changed)
@@ -499,7 +494,7 @@ def redact_ole_bin_preserve_size(
                     wrote = overwrite_bigfat(ole, base.obj, de_start, changed)
                     start_used = f"BigFAT(dir:{de_start})"
 
-            # (2) 정렬 브루트포스
+            # 정렬 브루트포스
             if wrote <= 0:
                 sig = orig[: min(64, len(orig))]
                 bf = _brute_bigfat_aligned(base.obj, sig, sector, max_k=8192)
@@ -507,7 +502,7 @@ def redact_ole_bin_preserve_size(
                     wrote = overwrite_bigfat(ole, base.obj, bf, changed)
                     start_used = f"BigFAT(brute-aligned:{bf})"
 
-            # (3) 비정렬 근사
+            # 비정렬 근사
             if wrote <= 0:
                 sig = orig[: min(64, len(orig))]
                 bf2 = _brute_bigfat_unaligned(
@@ -517,7 +512,7 @@ def redact_ole_bin_preserve_size(
                     wrote = overwrite_bigfat(ole, base.obj, bf2, changed)
                     start_used = f"BigFAT(brute-unaligned:{bf2})"
 
-            # (4) 미니스트림 브루트포스
+            # 미니스트림 브루트포스
             if wrote <= 0:
                 mini_start = _brute_ministream(ole, base.obj, orig)
                 if mini_start is not None:
