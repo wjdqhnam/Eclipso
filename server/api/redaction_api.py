@@ -9,39 +9,43 @@ from typing import Dict, List, Optional, Literal, Tuple, Set, Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, Response, HTTPException
-
 from server.core.schemas import DetectResponse, PatternItem, Box
-from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction
+from server.modules.pdf_module import detect_boxes_from_patterns, apply_redaction,extract_table_layout    
 from server.core.redaction_rules import PRESET_PATTERNS
-from server.modules.common import compile_rules  # ★ 추가
-# 더 이상 find_sensitive_spans 는 사용하지 않음
-# from server.core.matching import find_sensitive_spans
+from server.modules.common import compile_rules
 
 router = APIRouter(tags=["redaction"])
 log = logging.getLogger("redaction.router")
+
+
+def _run_validator(value: str, validator) -> bool:
+    if not callable(validator):
+        return True
+    try:
+        try:
+            return bool(validator(value))
+        except TypeError:
+            # 일부 validator는 (value, opts) 형태를 사용하므로 두 번째 인자를 None으로 보냄
+            return bool(validator(value, None))
+    except Exception:
+        return False
 
 
 def _ensure_pdf(file: UploadFile) -> None:
     if file is None:
         raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
     if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="PDF 파일을 업로드하세요.")
+        raise HTTPException(status_code=400, detail="PDF 파일이 아닙니다.")
 
 
 def _read_pdf(file: UploadFile) -> bytes:
-    data = file.file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 파일입니다.")
-    return data
+    try:
+        return file.file.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF 읽기 실패: {e}")
 
 
 def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
-    """
-    입력 허용
-    - None / "" / 공백 / "null" / "None" -> PRESET_PATTERNS
-    - 배열: [ { ... } ]
-    - 객체: { "patterns": [ { ... } ] }
-    """
     if patterns_json is None:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
@@ -50,16 +54,11 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
         return [PatternItem(**p) for p in PRESET_PATTERNS]
 
     try:
-        obj = json.loads(s)
+        obj = json.loads(patterns_json)
     except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "잘못된 patterns_json: JSON 파싱 실패. 예: {'patterns': [...]} 또는 [...]. "
-                f"구체적 오류: {e}"
-            ),
-        )
+        raise HTTPException(status_code=400, detail=f"patterns_json 파싱 실패: {e}")
 
+    arr: List[Dict[str, Any]]
     if isinstance(obj, dict):
         if "patterns" in obj and isinstance(obj["patterns"], list):
             arr = obj["patterns"]
@@ -83,11 +82,6 @@ def _parse_patterns_json(patterns_json: Optional[str]) -> List[PatternItem]:
 
 
 def _compile_patterns(items: List[PatternItem]) -> List[Any]:
-    """
-    PatternItem -> 어댑터 객체(SimpleNamespace)
-    - compiled: re.Pattern
-    - 기존 필드: 그대로 속성화
-    """
     compiled: List[Any] = []
     for it in items:
         # PatternItem 속성 추출
@@ -116,28 +110,31 @@ def _compile_patterns(items: List[PatternItem]) -> List[Any]:
     response_model=DetectResponse,
     summary="PDF 패턴 박스 탐지",
     description=(
-        "- 정규식 패턴 → 좌표 박스\n"
-        "- 입력: file(PDF), patterns_json(JSON 문자열 | 생략)\n"
-        "- 출력: total_matches, boxes"
+        "PDF에서 정규식/패턴에 해당하는 텍스트 박스를 탐지하여"
+        " 좌표(Box 리스트)로 반환한다."
     ),
 )
 async def detect(
     file: UploadFile = File(..., description="PDF 파일"),
-    patterns_json: Optional[str] = Form(None, description="패턴 목록 JSON(옵션)"),
+    patterns_json: Optional[str] = Form(
+        None,
+        description="커스텀 패턴 정의(JSON 문자열, 생략 시 PRESET_PATTERNS 사용)",
+    ),
 ):
     _ensure_pdf(file)
-    pdf = await file.read()
+    pdf_bytes = _read_pdf(file)
 
-    # 로깅(옵션)
-    if patterns_json is None:
-        log.debug("patterns_json: None")
-    else:
-        log.debug("patterns_json(len=%d): %r", len(patterns_json), patterns_json[:200])
+    # 패턴 로드
+    patterns = _load_patterns_json(patterns_json)
 
-    items = _parse_patterns_json(patterns_json)
-    patterns = _compile_patterns(items)
-    boxes = detect_boxes_from_patterns(pdf, patterns)
-    return DetectResponse(total_matches=len(boxes), boxes=boxes)
+    # 기본 구현은 PRESET_PATTERNS 그대로 사용
+    boxes = detect_boxes_from_patterns(pdf_bytes, patterns)
+    return DetectResponse(
+        ok=True,
+        patterns=patterns,
+        boxes=boxes,
+        preview_url=None,
+    )
 
 
 @router.post(
@@ -153,7 +150,9 @@ async def apply(
     pdf = _read_pdf(file)
     fill = "black"
 
-    boxes = detect_boxes_from_patterns(pdf, [PatternItem(**p) for p in PRESET_PATTERNS])
+    boxes = detect_boxes_from_patterns(
+        pdf, [PatternItem(**p) for p in PRESET_PATTERNS]
+    )
     out = apply_redaction(pdf, boxes, fill=fill)
 
     return Response(
@@ -163,80 +162,82 @@ async def apply(
     )
 
 
-# ─────────────────────────────────────────────────────────────
-# 텍스트 매칭 (정규식 + validator)  →  /text/match 가 이 함수 사용
-# ─────────────────────────────────────────────────────────────
-
 def match_text(text: str):
-    """
-    정규식 기반 민감정보 매칭
-
-    - 입력: text
-    - 출력: { items, counts }
-
-    items:
-      - rule   : 룰 이름 (rrn, phone_mobile, ...)
-      - value  : 매칭 문자열
-      - start  : 텍스트 내 시작 오프셋
-      - end    : 텍스트 내 끝 오프셋
-      - context: 주변 20자 전후
-      - valid  : validator 기준 유효 여부 (True = OK, False = FAIL)
-
-    counts:
-      - OK(True) 인 것만 rule 별로 카운트 (FAIL 은 카운트에서 제외)
-    """
     try:
         if not isinstance(text, str):
             text = str(text)
-
-        # modules.common.compile_rules() 는 이미
-        # PRESET_PATTERNS + RULES 기반으로
-        # (name, compiled_regex, need_valid, priority, validator) 튜플을 만들어줌.
         comp = compile_rules()
 
-        matches: List[Dict[str, Any]] = {}
-        matches = []
+        matches: List[Dict[str, Any]] = []
         counts: Dict[str, int] = {}
 
-        for name, rx, need_valid, prio, validator in comp:
+        for rule_name, rx, need_valid, _prio, validator in comp:
             if rx is None:
                 continue
 
             for m in rx.finditer(text):
-                s, e = m.span()
-                val = m.group(0)
+                value = m.group(0)
 
-                ok = True
-                if need_valid and validator:
-                    try:
-                        try:
-                            ok = bool(validator(val))
-                        except TypeError:
-                            ok = bool(validator(val, None))
-                    except Exception:
-                        ok = False  # 검증 중 예외는 FAIL 취급
+                # --- validator로 OK / FAIL 판단 -------------------
+                is_valid = True
+                if need_valid:
+                    is_valid = _run_validator(value, validator)
 
-                ctx_start = max(0, s - 20)
-                ctx_end = min(len(text), e + 20)
+                start = m.start()
+                end = m.end()
+                ctx_start = max(0, start - 20)
+                ctx_end = min(len(text), end + 20)
 
+                #유효/무효와 상관없이 "정규식에 한 번 걸렸으면" 전부 기록
                 matches.append(
                     {
-                        "rule": name,
-                        "value": val,
-                        "start": s,
-                        "end": e,
+                        "rule": rule_name,
+                        "value": value,
+                        "start": start,
+                        "end": end,
                         "context": text[ctx_start:ctx_end],
-                        "valid": ok,
+                        "valid": bool(is_valid),
                     }
                 )
 
-                # counts 는 OK 만 집계
-                if ok:
-                    counts[name] = counts.get(name, 0) + 1
+                # counts에는 OK/FAIL 합계(= 정규식 매칭 총 개수)를 넣어준다.
+                counts[rule_name] = counts.get(rule_name, 0) + 1
 
-        log.debug("regex match count=%d", len(matches))
+        log.debug(
+            "regex match count(total incl. invalid)=%d, rules=%d",
+            len(matches),
+            len(counts),
+        )
         return {"items": matches, "counts": counts}
 
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         log.exception("match_text 내부 오류")
         raise HTTPException(status_code=500, detail=f"매칭 오류: {e}")
+
+@router.post(
+    "/redactions/tables",
+    summary="PDF 표 레이아웃 탐지",
+    description=(
+        "pymupdf4llm으로 PDF 내 표 위치와 행/열 개수만 탐지\n"
+        "- 입력: file(PDF)\n"
+        "- 출력: { tables: [ { page, bbox, row_count, col_count }, ... ] }"
+    ),
+)
+async def detect_tables(
+    file: UploadFile = File(..., description="PDF 파일"),
+):
+    # 기존 유틸 재사용
+    _ensure_pdf(file)
+    pdf_bytes = _read_pdf(file)
+
+    # pdf_module.extract_table_layout 호출
+    try:
+        data = extract_table_layout(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"표 레이아웃 추출 중 오류: {e}",
+        )
+
+    # 그대로 JSON 반환
+    return data

@@ -1,10 +1,14 @@
-# server/modules/xlsx_module.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 import io, zipfile
 from typing import List, Tuple
-
-# ── common 유틸 임포트: 상대 경로 우선, 실패 시 절대 경로 fallback ────────────────
+import logging
+import inspect
+import os
+import olefile
+import re
+import unicodedata
+import xml.etree.ElementTree as ET
+from typing import List, Tuple, Optional
 try:
     from .common import (
         cleanup_text,
@@ -12,47 +16,168 @@ try:
         sub_text_nodes,
         chart_sanitize,
         xlsx_text_from_zip,
-        chart_rels_sanitize,
     )
-except Exception:  # pragma: no cover - 패키지 구조 달라졌을 때 대비
-    from server.modules.common import (  # type: ignore
+except Exception:
+    from server.modules.common import (
         cleanup_text,
         compile_rules,
         sub_text_nodes,
         chart_sanitize,
         xlsx_text_from_zip,
-        chart_rels_sanitize,
     )
 
-# ── schemas 임포트: core 우선, 실패 시 대안 경로 시도 ─────────────────────────
+from server.core.schemas import XmlMatch, XmlLocation
+
+log = logging.getLogger("xml_redaction")
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+
 try:
-    from ..core.schemas import XmlMatch, XmlLocation  # 일반적인 현재 리포 구조
+    from .ocr_image_redactor import redact_image_bytes  # type: ignore
 except Exception:
     try:
-        from ..schemas import XmlMatch, XmlLocation   # 일부 브랜치/옛 구조
+        from server.modules.ocr_image_redactor import redact_image_bytes  # type: ignore
     except Exception:
-        from server.core.schemas import XmlMatch, XmlLocation  # 절대경로 fallback
+
+        redact_image_bytes = None  # type: ignore
 
 
-# ── RULES(validator) 접근 ─────────────────────────────────────────────────────
-try:
-    from ..core.redaction_rules import RULES
-except Exception:
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _call_redact_image_bytes(fn, data: bytes, comp, *, filename: str, env_prefix: str, logger, debug: bool):
+    kwargs = {}
     try:
-        from ..redaction_rules import RULES  # type: ignore
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+        def _set_kw(k: str, v):
+            if v is None:
+                return
+            if has_varkw or (k in params):
+                kwargs[k] = v
+
+        _set_kw("filename", filename)
+        _set_kw("name", filename)
+        _set_kw("path", filename)
+
+        _set_kw("env_prefix", env_prefix)
+        _set_kw("prefix", env_prefix)
+        _set_kw("env", env_prefix)
+
+        _set_kw("logger", logger)
+        _set_kw("log", logger)
+
+        if debug:
+            _set_kw("debug", True)
+            _set_kw("verbose", True)
+            _set_kw("trace", True)
+
+        comp_kw_name = None
+        for cand in ("comp", "compiled", "compiled_rules", "rules"):
+            if has_varkw or (cand in params):
+                comp_kw_name = cand
+                break
+
+        pos_params = [
+            p for p in params.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        pos_count = len(pos_params)
+
     except Exception:
-        from server.core.redaction_rules import RULES  # type: ignore
+        sig = None
+        has_varkw = False
+        comp_kw_name = None
+        pos_count = 0
+
+    last_err = None
+
+    def _normalize_ret(ret):
+        # (bytes, hit)
+        if isinstance(ret, tuple) and len(ret) == 2:
+            red, hit = ret
+            if isinstance(red, bytearray):
+                red = bytes(red)
+            if isinstance(red, bytes):
+                try:
+                    return red, int(hit)
+                except Exception:
+                    return red, -1
+            return None
+
+        # bytes only
+        if isinstance(ret, bytearray):
+            return bytes(ret), -1
+        if isinstance(ret, bytes):
+            return ret, -1
+
+        return None
+
+    # 1) (data, comp, **kwargs)
+    try:
+        if sig is None or has_varkw or pos_count >= 2:
+            ret = fn(data, comp, **kwargs)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 2) (data, **kwargs)
+    try:
+        ret = fn(data, **kwargs)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 3) (data)
+    try:
+        ret = fn(data)
+        nr = _normalize_ret(ret)
+        if nr is not None:
+            return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    # 4) (data, rules/comp=<...>, **kwargs)
+    try:
+        if comp_kw_name is not None:
+            kw2 = dict(kwargs)
+            kw2[comp_kw_name] = comp
+            ret = fn(data, **kw2)
+            nr = _normalize_ret(ret)
+            if nr is not None:
+                return nr
+    except TypeError as e:
+        last_err = e
+    except Exception as e:
+        last_err = e
+
+    raise TypeError(f"redact_image_bytes call failed: {last_err!r}")
 
 
+# XLSX 텍스트 추출
 def xlsx_text(zipf: zipfile.ZipFile) -> str:
-    """XLSX(zip)에서 텍스트를 모아 하나의 문자열로 합칩니다."""
     return xlsx_text_from_zip(zipf)
 
 
-# ★ /text/extract, /redactions/xml/scan 에서 사용하는 래퍼
 def extract_text(file_bytes: bytes) -> dict:
-    """바이트로 들어온 XLSX에서 텍스트만 추출."""
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zipf:
+
         txt = xlsx_text(zipf)
     return {
         "full_text": txt,
@@ -81,38 +206,38 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
 
     for ent in comp:
         try:
-            # tuple/list 계열
             if isinstance(ent, (list, tuple)):
-                if len(ent) >= 3:
+                if len(ent) >= 5:
+                    rule_name, rx, need_valid, _prio, validator = ent[0], ent[1], bool(ent[2]), ent[3], ent[4]
+                elif len(ent) >= 3:
                     rule_name, rx, need_valid = ent[0], ent[1], bool(ent[2])
+                    validator = None
                 elif len(ent) >= 2:
                     rule_name, rx = ent[0], ent[1]
-                    need_valid = True
+                    need_valid, validator = True, None
                 else:
                     continue
             else:
-                # 네임드 객체(SimpleNamespace 등)
                 rule_name = getattr(ent, "name", getattr(ent, "rule", "unknown"))
                 rx = getattr(ent, "rx", getattr(ent, "regex", None))
                 need_valid = bool(getattr(ent, "need_valid", True))
+                validator = getattr(ent, "validator", None)
             if rx is None:
                 continue
         except Exception:
             continue
 
-        validator = _get_validator(rule_name)
-
         for m in rx.finditer(text):
             val = m.group(0)
             ok = True
-            if need_valid and validator:
+            if need_valid and callable(validator):
                 try:
                     try:
                         ok = bool(validator(val))
                     except TypeError:
                         ok = bool(validator(val, None))
                 except Exception:
-                    ok = False  # 검증 예외는 실패로 간주
+                    ok = False
 
             out.append(
                 XmlMatch(
@@ -127,26 +252,76 @@ def scan(zipf: zipfile.ZipFile) -> Tuple[List[XmlMatch], str, str]:
     return out, "xlsx", text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 파일 단위 레닥션: 시트/공유문자열/차트/차트.rels 처리
-# ─────────────────────────────────────────────────────────────────────────────
 def redact_item(filename: str, data: bytes, comp):
     low = filename.lower()
+    log.info("[XLSX][RED] filename=%s low=%s size=%d", filename, low, len(data))
 
-    # 1) 셀/공유문자열: 텍스트 노드 마스킹
     if low == "xl/sharedstrings.xml" or low.startswith("xl/worksheets/"):
         b, _ = sub_text_nodes(data, comp)
         return b
 
-    # 2) 차트 본문: a:t, c:strCache 라벨 마스킹 (+ 남은 텍스트 노드 안전망)
     if low.startswith("xl/charts/") and low.endswith(".xml"):
         b2, _ = chart_sanitize(data, comp)
         return b2
 
-    # 3) 차트 관계(.rels)
-    if low.startswith("xl/charts/_rels/") and low.endswith(".rels"):
-        b3, _ = chart_rels_sanitize(data)
-        return b3
+    if low.startswith("xl/media/") and low.endswith(IMAGE_EXTS):
+        log.info("[XLSX][IMG] image=%s size=%d", filename, len(data))
 
-    # 4) 기타 파트는 원본 유지
+        if not _env_bool("XLSX_OCR_IMAGES", True):
+            log.info("[XLSX][IMG][OCR] disabled by env (XLSX_OCR_IMAGES=0) image=%s", filename)
+            return data
+
+        if redact_image_bytes is None:
+            log.warning("[XLSX][IMG][OCR] ocr_image_redactor not available -> skip (%s)", filename)
+            return data
+
+        debug = _env_bool("XLSX_OCR_DEBUG", False)
+
+        log.info("[XLSX][IMG][OCR] start image=%s size=%d debug=%s", filename, len(data), debug)
+        try:
+            red, hit = _call_redact_image_bytes(
+                redact_image_bytes,
+                data,
+                comp,
+                filename=filename,
+                env_prefix="XLSX",
+                logger=log,
+                debug=debug,
+            )
+
+            changed = (red != data)
+            log.info(
+                "[XLSX][IMG][OCR] end image=%s in=%d out=%d changed=%s hit=%s",
+                filename,
+                len(data),
+                len(red) if isinstance(red, (bytes, bytearray)) else -1,
+                changed,
+                hit,
+            )
+
+            if hit == -1:
+                return red
+            if hit > 0:
+                return red
+            return data
+
+        except Exception as e:
+            log.exception("[XLSX][IMG][OCR] failed image=%s err=%r", filename, e)
+            return data
+
     return data
+
+
+def extract_images(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    out: List[Tuple[str, bytes]] = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as z:
+        for name in z.namelist():
+            low = name.lower()
+            if low.startswith("xl/media/") and low.endswith(IMAGE_EXTS):
+                try:
+                    data = z.read(name)
+                    out.append((name, data))
+                    log.info("[XLSX][IMG] image=%s size=%d", name, len(data))
+                except KeyError:
+                    pass
+    return out
