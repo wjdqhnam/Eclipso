@@ -399,7 +399,7 @@ def _collect_targets_by_regex(text: str) -> List[str]:
 # ─────────────────────────────
 # 하이픈 제외 마스킹 헬퍼 유틸
 def _except_hyphen(text: str) -> str:
-    return "".join("-" if ch == "-" else "*" for ch in text)
+    return "".join(ch if ch in "-@" else "*" for ch in text)
 
 # 특정 인코딩 기준 동일 길이 마스킹
 def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
