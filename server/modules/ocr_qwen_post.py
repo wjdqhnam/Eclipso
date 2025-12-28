@@ -10,7 +10,7 @@ from ollama._types import ResponseError
 
 log = logging.getLogger(__name__)
 
-QWEN_MODEL = "qwen2.5vl:7b"
+QWEN_MODEL = "qwen2.5vl:3b"
 OLLAMA_HOST = "http://localhost:11434"
 
 _client: Client | None = None

@@ -9,6 +9,7 @@ import olefile
 
 from server.core.normalize import normalization_text
 from server.core.matching import find_sensitive_spans
+from server.modules.ocr_image_redactor import redact_image_bytes
 
 
 # ─────────────────────────────
@@ -218,10 +219,6 @@ def discover_ole_ids(section_bytes: bytes) -> List[int]:
 
     return ids
 
-# ─────────────────────────────
-# 이미지 추출
-# ─────────────────────────────
-IMAGE_EXTS = (".bmp", ".gif", ".jpg", ".jpeg",".pcx", ".pic", ".png", ".tif", ".tiff")
 
 # HWP 본문 텍스트에 섞여 나오는 제어문자/쓰레기 유니코드 제거(줄바꿈/탭은 유지)
 _CTRL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
@@ -300,6 +297,16 @@ def _clean_hwp_text(s: str) -> str:
 
     return "\n".join(cleaned_lines).strip()
 
+
+# ─────────────────────────────
+# 이미지 추출
+# ─────────────────────────────
+IMAGE_EXTS = (".bmp", ".gif", ".jpg", ".jpeg",".pcx", ".pic", ".png", ".tif", ".tiff")
+
+def is_image_exts(name: str) -> bool:
+    return name.lower().endswith(IMAGE_EXTS)
+
+# BinData에서 이미지 스트림 추출
 def extract_bindata_images(file_bytes: bytes) -> list[dict]:
     results = []
 
@@ -328,6 +335,30 @@ def extract_bindata_images(file_bytes: bytes) -> list[dict]:
             })
 
     return results
+
+
+# 이미지 ocr 레닥션 처리 후 교체
+def replace_img(img_bytes: bytes, meta: dict) -> bytes:
+    try:
+        redacted, hit = redact_image_bytes(
+            img_bytes,
+            filename=meta.get("filename", "image"),
+            env_prefix="HWP",
+        )
+    except Exception:
+        return img_bytes  # OCR 실패시 원본 유지
+
+    # OCR 결과 없다면 원본 유지
+    if not hit:
+        return img_bytes
+
+    if len(redacted) < len(img_bytes):
+        return redacted + b"\x00" * (len(img_bytes) - len(redacted))
+
+    if len(redacted) > len(img_bytes):
+        return img_bytes  # 커지면 원본 유지
+
+    return redacted
 
 
 
@@ -368,7 +399,7 @@ def _collect_targets_by_regex(text: str) -> List[str]:
 # ─────────────────────────────
 # 하이픈 제외 마스킹 헬퍼 유틸
 def _except_hyphen(text: str) -> str:
-    return "".join("-" if ch == "-" else "*" for ch in text)
+    return "".join(ch if ch in "-@" else "*" for ch in text)
 
 # 특정 인코딩 기준 동일 길이 마스킹
 def replace_bytes_with_enc(data: bytes, old: str, enc: str, max_log: int = 0):
@@ -589,7 +620,9 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
         streams = ole.listdir(streams=True, storages=False)
         cutoff = getattr(ole, "minisector_cutoff", 4096)
 
+        # ─────────────────────────────
         # BodyText 레닥션 (문단 텍스트)
+        # ─────────────────────────────
         for path in streams:
             if not (len(path) >= 2 and path[0] == "BodyText" and path[1].startswith("Section")):
                 continue
@@ -628,15 +661,11 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
         # ─────────────────────────────
         # BinData 처리
         # ─────────────────────────────
+        for path in streams:
+            if len(path) != 2 or path[0] != "BinData":
+                continue
 
-        bindata_paths = [
-            tuple(p) for p in streams
-            if len(p) >= 2 and p[0] == "BinData" and p[1].endswith(".OLE")
-        ]
-
-        print(f"[DBG][BinData] found {len(bindata_paths)} streams")
-        for path in bindata_paths:
-            print(f"\n[DBG][BinData] === processing {path} ===")
+            name = path[1]
 
             try:
                 raw = ole.openstream(path).read()
@@ -644,31 +673,41 @@ def redact(file_bytes: bytes, spans: Optional[List[Dict[str, Any]]] = None) -> b
                 print(f"[DBG][BinData] read failed: {e}")
                 continue
 
-            print(f"[DBG][BinData] original size={len(raw)}")
-
-            rep, hit = _replace_in_bindata_smart(raw)
-
-            if hit <= 0:
-                print("[DBG][BinData] no hits → skip overwrite")
-                continue
-
-            if len(rep) != len(raw):
-                print("[DBG][BinData][ERROR] size changed → skip overwrite")
-                continue
-
             entry = _direntry_for(ole, path)
             if not entry:
-                print("[DBG][BinData] no direntry → skip")
                 continue
 
-            if entry.size < cutoff:
-                _overwrite_minifat_chain(ole, container, entry.isectStart, rep)
-                print("[DBG][BinData] written via MiniFAT")
-            else:
-                _overwrite_bigfat(ole, container, entry.isectStart, rep)
-                print("[DBG][BinData] written via BigFAT")
+            # 이미지 -> OCR
+            if is_image_exts(name):
+                new_raw = replace_img(
+                    raw,
+                    {"filename": name}
+                )
 
-        # 3) PrvText / PrvImage
+                # OCR 결과가 없거나 변경 없으면 스킵
+                if new_raw == raw:
+                    continue
+
+            # 차트
+            else:
+                new_raw, hit = _replace_in_bindata_smart(raw)
+
+                if hit <= 0:
+                    continue
+
+                if len(new_raw) != len(raw):
+                    continue
+
+            # 덮어쓰기
+            if entry.size < cutoff:
+                _overwrite_minifat_chain(ole, container, entry.isectStart, new_raw)
+            else:
+                _overwrite_bigfat(ole, container, entry.isectStart, new_raw)
+
+
+        # ─────────────────────────────
+        # Prv 계열 처리
+        # ─────────────────────────────
         for path in streams:
             if len(path) == 1:
                 name = path[0].lower()
